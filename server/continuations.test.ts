@@ -290,6 +290,21 @@ describe("Codex account continuations", () => {
     expect(t.sent.at(-1)?.text).toContain("Current user correction before the limit");
   });
 
+  it("links the original tab and its continuation both ways, once per pair", async () => {
+    const t = await setup();
+    const service = t.service();
+    const b = (await service.setAgentAccount(t.paseo, "root", "b")).continuedIn!;
+    const state = await t.store.read();
+    expect(state.links.root?.next).toMatchObject({ agentId: b.agentId });
+    expect(state.links[b.agentId]?.previous).toMatchObject({ agentId: "root", title: "Fix the build", workspaceId: "workspace-1" });
+    const back = () => t.notes.filter((note) => note.agentId === b.agentId && (note.row as unknown as { direction?: string }).direction === "from");
+    expect(back()).toHaveLength(1);
+    expect(t.notes.find((note) => note.agentId === "root")?.row).toMatchObject({ outcome: "continued", continuedIn: { agentId: b.agentId } });
+    await service.setAgentAccount(t.paseo, b.agentId, "a");
+    await service.setAgentAccount(t.paseo, "root", "b");
+    expect(back()).toHaveLength(1);
+  });
+
   it("continues an account-limit turn in error status into an available account's existing error-status tab", async () => {
     const t = await setup();
     const service = t.service();
