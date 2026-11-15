@@ -1,5 +1,6 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
+import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useCallback, useState } from "react";
 import { Text, View } from "react-native";
 import { MAX_CHAIN_STEPS, POOL_LABEL, type ChainStep, type ChainView } from "../shared/chains";
@@ -41,6 +42,14 @@ export function stepLine(step: ChainView["steps"][number], index: number): strin
   return `${index + 1}. ${step.label}${extras ? ` · ${extras}` : ""}`;
 }
 
+/** Whether, and as what, the chain is offered in Paseo's model picker and Agent profiles; null from an older server. */
+export function pickerLine(chain: ChainView): string | null {
+  if (chain.provider) return `In the model picker and Agent profiles: “${chain.provider.label}”`;
+  if (chain.picker === false) return "Not in the model picker or Agent profiles";
+  if (chain.provider === null) return "Not in the model picker: no step it can start on";
+  return null;
+}
+
 /** The "Chains" section of the Accounts screen: fallback chains, the default one, and their editor. */
 export function ChainsSection({ theme, state, store, compact }: { theme: Theme; state: StateView; store: ZeroSubStore; compact: boolean }) {
   const text = useText(theme);
@@ -69,6 +78,16 @@ export function ChainsSection({ theme, state, store, compact }: { theme: Theme; 
         default chain from its first step; switch one with the account button or /chain. An agent on a chain uses it instead of "fork to the
         other provider" and the paid last-resort rule.
       </Text>
+      <Text style={text.small}>
+        Each chain is also a provider in Paseo's model picker and Agent profiles, as “⛓ name”: an agent started on it follows that chain,
+        whatever the default. It lists the models of the chain's first provider; the one you pick is used for the first step.
+      </Text>
+      {state.chainProvidersError ? (
+        <Text style={text.danger}>
+          Couldn't add the chains to Paseo's model picker and Agent profiles ({state.chainProvidersError}). Agents can still follow a chain
+          by /chain or the account button.
+        </Text>
+      ) : null}
       {chains.length === 0 ? <Text style={text.muted}>No chains. Agents switch accounts as without chains.</Text> : null}
       {chains.map((chain) => (
         <ChainCard key={chain.id} theme={theme} chain={chain} store={store} onEdit={() => setEditing(chain)} />
@@ -107,6 +126,7 @@ function ChainCard({ theme, chain, store, onEdit }: { theme: Theme; chain: Chain
         {chain.isDefault ? <Badge theme={theme} label="Default" tone="accent" /> : null}
         {chain.auto ? <Badge theme={theme} label="Follows your accounts" /> : null}
       </View>
+      {pickerLine(chain) ? <Text style={text.muted}>{pickerLine(chain)}</Text> : null}
       <View style={{ gap: 4 }}>
         {chain.steps.map((step, index) => (
           <Text key={`${index}-${keyOf(step)}`} style={step.status === "broken" ? text.danger : text.body}>
@@ -158,6 +178,7 @@ function ChainEditor({ theme, state, store, chain, onClose }: { theme: Theme; st
   const [steps, setSteps] = useState<ChainStep[]>(() =>
     chain ? chain.steps.map(({ source, accountId, model, thinking }) => ({ source, accountId, model, thinking })) : [{ source: "claude", accountId: null, model: null, thinking: null }],
   );
+  const [picker, setPicker] = useState(chain?.picker !== false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const change = (index: number, patch: Partial<ChainStep>) => setSteps(steps.map((step, at) => (at === index ? { ...step, ...patch } : step)));
@@ -171,7 +192,7 @@ function ChainEditor({ theme, state, store, chain, onClose }: { theme: Theme; st
     setSaving(true);
     setError(null);
     try {
-      await store.rpc(saveChain, { ...(chain ? { id: chain.id } : {}), name: name.trim(), steps });
+      await store.rpc(saveChain, { ...(chain ? { id: chain.id } : {}), name: name.trim(), steps, picker });
       toast.show(chain ? "Saved" : `Added “${name.trim()}”`, { variant: "success" });
       onClose();
     } catch (failure) {
@@ -265,6 +286,18 @@ function ChainEditor({ theme, state, store, chain, onClose }: { theme: Theme; st
             Model and thinking apply when the chain starts a new agent for the step (a fork to the other provider); empty uses that provider's
             default. An agent moved in place keeps its model.
           </Text>
+          <SettingsCard>
+            <SettingsSwitch
+              label="Show in model picker and Agent profiles"
+              hint={
+                picker
+                  ? `Pick “⛓ ${name.trim() || "this chain"}” as the provider in an Agent profile or the model picker: agents started on it follow this chain.`
+                  : "Agents follow it only by /chain, the account button, or as the default chain."
+              }
+              value={picker}
+              onValueChange={setPicker}
+            />
+          </SettingsCard>
           {error ? <Text style={text.danger}>{error}</Text> : null}
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
             <Button theme={theme} label="Cancel" tooltip="Close without saving" tooltipAlign="end" onPress={onClose} />
