@@ -1,5 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
+import { ChainStepSchema, MAX_CHAIN_STEPS } from "./chains";
 import { ApiPriceSchema, BedrockSourceSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema } from "./model";
 
 export const getState = defineRpc({
@@ -259,4 +260,38 @@ export const setAgentAccount = defineRpc({
     accountId: z.string().nullable(),
   }),
   output: ReopenSummarySchema,
+});
+
+/** Creates a fallback chain (no `id`) or replaces one's name and steps. */
+export const saveChain = defineRpc({
+  name: "zerosub.chains.save",
+  input: z.object({
+    id: z.string().optional(),
+    name: z.string().trim().min(1).max(40),
+    steps: z.array(ChainStepSchema).min(1).max(MAX_CHAIN_STEPS),
+  }),
+  output: z.object({ id: z.string() }),
+});
+
+export const deleteChain = defineRpc({
+  name: "zerosub.chains.delete",
+  input: z.object({ id: z.string() }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/** The chain new agents follow; `null` for none (new agents then behave as without chains). */
+export const setDefaultChain = defineRpc({
+  name: "zerosub.chains.default",
+  input: z.object({ id: z.string().nullable() }),
+  output: z.object({ ok: z.literal(true) }),
+});
+
+/**
+ * The chain one agent follows: `chain` (with `chainId`), `default` (the default chain, from its first
+ * step), or `off` (no chain: the agent behaves exactly as without chains).
+ */
+export const setAgentChain = defineRpc({
+  name: "zerosub.agents.chain",
+  input: z.object({ agentId: z.string(), mode: z.enum(["chain", "default", "off"]), chainId: z.string().optional() }),
+  output: z.object({ ok: z.literal(true), chain: z.string().nullable() }),
 });

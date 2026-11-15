@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { AgentChainViewSchema, AgentLinksSchema, ChainViewSchema } from "./chains";
 
 /**
  * The provider families this plugin manages: the subscription CLIs (Claude Code, Codex, Grok Build),
@@ -387,6 +388,12 @@ export const AgentRouteSchema = z.object({
   movable: z.boolean(),
   /** The agent started on this account because its weekly reset was near, and is still on it. */
   selectionReason: z.literal("weekly_reset").optional(),
+  /** The fallback chain it follows and the step it's at (this fork); null or absent: no chain. */
+  chain: AgentChainViewSchema.nullable().optional(),
+  /** Its chain was turned off for it (`/chain off`), rather than it never having one. */
+  chainOff: z.boolean().optional(),
+  /** Where its conversation went on, or came from, in another agent. */
+  links: AgentLinksSchema.optional(),
 });
 export type AgentRoute = z.infer<typeof AgentRouteSchema>;
 
@@ -450,5 +457,7 @@ export const StateViewSchema = z.object({
   /** The AWS region the host's own AWS setup names (environment, ~/.aws/config, or the EC2 instance's), for new Bedrock accounts. */
   awsRegion: z.string().nullable().optional(),
   warnings: z.array(z.string()),
+  /** Fallback chains (this fork); absent from servers without them. */
+  chains: z.array(ChainViewSchema).optional(),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

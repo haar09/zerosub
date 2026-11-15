@@ -97,13 +97,18 @@ export function mostAvailable(
   usageOf: (accountId: string) => Usage | null | undefined,
   now: number,
   exclude: ReadonlySet<string> = new Set(),
+  options: { lastResort?: boolean } = {},
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const open = accountsOf(state, family).filter((account) => !exclude.has(account.id));
   const subscriptions = open.filter((account) => canStandIn(account, now));
   // Only once every subscription account is out (at its limit, signed out, disabled) does routing
-  // put work on a paid API account (Azure, Bedrock) by itself.
-  const candidates = subscriptions.length > 0 ? subscriptions : open.filter((account) => isLastResort(account) && isUsable(account, now));
+  // put work on a paid API account (Azure, Bedrock) by itself. An agent on a fallback chain's
+  // subscription step never does: the chain says where it goes next (`lastResort: false`).
+  const candidates =
+    subscriptions.length > 0 || options.lastResort === false
+      ? subscriptions
+      : open.filter((account) => isLastResort(account) && isUsable(account, now));
   const rank = (account: StoredAccount) => {
     const usage = usageOf(account.id);
     const score = headroomScore(usage, now);
@@ -174,6 +179,11 @@ export interface RouteInput {
    * open, not Paseo's helpers (see `takesNextPick` in service.ts). Only a new agent takes it.
    */
   allowNextPick?: boolean;
+  /**
+   * The fallback chain step the agent is at (see server/chains.ts). `pool`: only the family's
+   * subscription accounts, never a paid stand-in by itself. `account`: that one Bedrock or Azure account.
+   */
+  step?: { kind: "pool" } | { kind: "account"; accountId: string };
 }
 
 export interface RouteDecision {
@@ -206,8 +216,14 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
 
   const binding = state.bindings[input.agentId];
   const bound = findAccount(state, binding?.accountId);
-  let account = bound && bound.family === input.family ? bound : undefined;
+  const pool = input.step?.kind === "pool";
+  const lastResort = pool ? { lastResort: false } : {};
+  const mayMove = fresh || input.portable;
+  // On a chain's subscription step, a pin to a paid account (from before, or a step it has left)
+  // doesn't hold an agent that can move: the chain put it back on subscriptions.
+  let account = bound && bound.family === input.family && !(pool && mayMove && isLastResort(bound)) ? bound : undefined;
   let bind: Binding | null = null;
+  const stepAccount = input.step?.kind === "account" ? findAccount(state, input.step.accountId) : undefined;
 
   // A pick whose account can't take the agent (at its limit, signed out, disabled, removed) is spent
   // all the same, and the agent routes as usual: kept, it would send every new agent to whichever
@@ -220,9 +236,14 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
       bind = { accountId: picked.id, source: "user", at };
     }
   }
+  // A chain's API-account step runs on that account, unless the conversation can't move (a ChatGPT
+  // thread stays where its binding holds it) or it was just picked for this new agent.
+  if (stepAccount && stepAccount.family === input.family && mayMove && bind?.source !== "user") {
+    return { account: stepAccount, bind: input.portable ? null : { accountId: stepAccount.id, source: "thread", at }, skipped: null, nextPick };
+  }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
-    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
+    account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now, new Set(), lastResort);
     if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
   }
   if (!account) {
@@ -231,6 +252,10 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     // its encrypted reasoning can't be read. Only a brand-new agent follows the default.
     const unrouted = !input.portable && !fresh && !state.sessions[input.agentId] ? mainAccount(state, input.family) : undefined;
     account = unrouted ?? defaultAccount(state, input.family);
+    // A paid default isn't a subscription step's account: the roomiest subscription account stands in.
+    if (account && pool && mayMove && isLastResort(account)) {
+      account = mostAvailable(state, input.family, input.usageOf, input.now, new Set(), lastResort) ?? account;
+    }
     // A thread that can't move is pinned to the account it first opened on.
     if (account && !input.portable) bind = { accountId: account.id, source: "thread", at };
   }
@@ -238,16 +263,15 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
 
   let skipped: RouteDecision["skipped"] = null;
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
-  const mayMove = fresh || input.portable;
   if (why && mayMove && (input.autoSwitch || why !== "limited")) {
     const staying = findAccount(state, input.current);
     // A paid API stand-in is only kept while no subscription account could take over from it.
     const keepsStaying = (stand: StoredAccount) =>
-      !isLastResort(stand) || !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now));
+      !isLastResort(stand) || (!pool && !accountsOf(state, input.family).some((other) => other.id !== account!.id && canStandIn(other, input.now)));
     const alternative =
       staying && staying.family === input.family && staying.id !== account.id && isUsable(staying, input.now) && keepsStaying(staying)
         ? staying
-        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+        : mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]), lastResort);
     if (alternative) {
       skipped = { account, why };
       account = alternative;

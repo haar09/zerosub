@@ -33,7 +33,25 @@ import {
 import { capsAccount, limitedPick } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
 import type { RedeemResult, ReopenSummary } from "../shared/rpc";
-import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
+import { LINK_ROW_KIND, LINK_ROW_VERSION, SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type LinkRow, type SwitchRow } from "../shared/timeline";
+import type { AgentChainView, Chain, ChainStep } from "../shared/chains";
+import {
+  chainOf,
+  chainProblem,
+  chainViews,
+  earliestFree,
+  isBroken,
+  isChainFamily,
+  leavingText,
+  newChainId,
+  placement,
+  seedChains,
+  stepAccount,
+  stepAvailable,
+  stepFamily,
+  stepLabel,
+  stepOf,
+} from "./chains";
 import {
   applyEnv,
   missingAdapter,
@@ -102,6 +120,7 @@ import {
   type ContinuationChain,
   type LiveSession,
   type NextAgentPick,
+  type AgentChain,
   type StoredAccount,
   type StoredState,
 } from "./state";
@@ -447,6 +466,7 @@ export class Service {
       // The last readings show right away; fresh ones replace them as they arrive.
       for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
       await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
+      await this.seedChains();
       // Read once, for new AWS Bedrock accounts' region (an EC2 host's takes a metadata request).
       void detectHostRegion();
       this.started = true;
@@ -503,6 +523,7 @@ export class Service {
         void this.ensureFamily(family).catch(() => undefined);
       }
     }
+    await this.seedChains().catch((error: unknown) => log("could not seed the default chain", error));
     const state = await this.store.read();
     for (const account of state.accounts) {
       const attempted = this.usageAttemptAt.get(account.id) ?? 0;
@@ -607,6 +628,7 @@ export class Service {
       [
         ...Object.entries(state.sessions).map(([id, session]) => [id, session.openedAt] as const),
         ...Object.entries(state.bindings).map(([id, binding]) => [id, binding.at] as const),
+        ...Object.entries(state.agentChains).map(([id, record]) => [id, record.at] as const),
       ]
         .filter(([id, at]) => !known.has(id) && old(at))
         .map(([id]) => id),
@@ -631,8 +653,12 @@ export class Service {
     const staleChains = Object.entries(state.continuations).filter(([, chain]) =>
       !unsettled(chain.pending) && Object.keys(chain.members).every((id) => !active.has(id) && !this.switching.has(id)),
     );
-    if (staleSessions.length === 0 && staleBindings.length === 0 && staleChains.length === 0) return;
+    const staleAgentChains = Object.entries(state.agentChains).filter(([id, record]) => gone.has(id) && old(record.at)).map(([id]) => id);
+    const staleLinks = Object.keys(state.links).filter((id) => gone.has(id));
+    if (staleSessions.length === 0 && staleBindings.length === 0 && staleChains.length === 0 && staleAgentChains.length === 0 && staleLinks.length === 0) return;
     await this.store.update((draft) => {
+      for (const id of staleAgentChains) delete draft.agentChains[id];
+      for (const id of staleLinks) delete draft.links[id];
       for (const [id] of staleSessions) delete draft.sessions[id];
       for (const [id] of staleBindings) delete draft.bindings[id];
       for (const [id] of staleChains) delete draft.continuations[id];
@@ -854,7 +880,17 @@ export class Service {
     const reload = interactive ? this.reloads.get(request.agentId) : undefined;
     if (reload) reload.opens += 1;
     const ownReload = reload?.opens === 1;
-    const state = await this.store.read();
+    let state = await this.store.read();
+    // A new agent of the user's own follows the default fallback chain from its first step. An
+    // agent ZeroSub creates to carry work on already has its chain (see `inheritChain`).
+    if (request.reason === "create" && isChainFamily(family) && takesNextPick(request) && state.defaultChain && !state.agentChains[request.agentId]) {
+      const chainId = state.defaultChain;
+      state = await this.store.update((draft) => {
+        if (!draft.agentChains[request.agentId] && draft.chains.some((chain) => chain.id === chainId)) {
+          draft.agentChains[request.agentId] = { chainId, step: 0, manual: false, at: new Date(now).toISOString() };
+        }
+      });
+    }
     const input: RouteInput = {
       agentId: request.agentId,
       family,
@@ -867,6 +903,7 @@ export class Service {
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
       allowNextPick: takesNextPick(request),
+      step: this.stepInput(state, request.agentId, family),
     };
     const first = chooseAccount(state, input);
     if (!first) return undefined;
@@ -1254,8 +1291,16 @@ export class Service {
       }
       return;
     }
+    // An agent on a fallback chain rotates within its step (the subscription pool) as usual, then
+    // walks its chain (see `advanceChain`), which replaces the fork toggle and the last-resort rule.
+    const chainContext = this.chainFor(latest, agentId, family);
+    const chainStep = chainContext ? this.stepInput(latest, agentId, family) : undefined;
     const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
-    const next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    const next = adapter.portable
+      ? move?.account
+      : chainStep?.kind === "account"
+        ? undefined
+        : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]), chainContext ? { lastResort: false } : {});
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled) {
         // Opt-in: every account is out, so spend a banked reset rather than stop.
@@ -1285,6 +1330,10 @@ export class Service {
         }
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
       }
+      if (chainContext) {
+        await this.advanceChain(paseo, agentId, family, account, chainContext, timeline, reason, base, endedAt, now);
+        return;
+      }
       if (reason !== "limit") return;
       let detail: string | null = null;
       const otherFamily = OTHER_FAMILY[family];
@@ -1295,6 +1344,7 @@ export class Service {
         }));
         if ("fork" in result) {
           this.switchGuard.note(agentId, now);
+          if (!result.reused) await this.linkContinuation(paseo, agentId, result.fork);
           await this.appendRow(paseo, agentId, {
             ...base,
             to: result.account.label,
@@ -1359,6 +1409,8 @@ export class Service {
     try {
       const continuation = await this.continueElsewhere(paseo, agentId, next, why, timeline, "auto");
       this.switchGuard.note(agentId, now);
+      if (chainContext) await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, chainContext.index));
+      await this.linkContinuation(paseo, agentId, continuation);
       await this.appendRow(paseo, agentId, {
         ...base,
         to: next.label,
@@ -1630,10 +1682,275 @@ export class Service {
    * else the roomiest other one, which it's then pinned to. Undefined when there's none.
    */
   private nextAccount(state: StoredState, agentId: string, family: Family, exhausted: string): { account: StoredAccount; pin: boolean } | undefined {
+    const step = this.stepInput(state, agentId, family);
+    // A chain's API-account step has no other account to rotate to: the chain moves on (see `advanceChain`).
+    if (step?.kind === "account") return undefined;
     const routed = this.routeFor(state, agentId, family, exhausted);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]));
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), step ? { lastResort: false } : {});
     return roomiest && { account: roomiest, pin: true };
+  }
+
+  // ------------------------------------------------------------------ fallback chains (this fork)
+
+  /** Seeds the default chain on first run, and keeps a seeded, unedited chain in step with the accounts. */
+  private async seedChains(): Promise<void> {
+    if (!seedChains(structuredClone(await this.store.read()))) return;
+    await this.store.update((draft) => {
+      seedChains(draft);
+    });
+  }
+
+  /** The chain an agent of `family` follows and the step it runs at now; null for none. */
+  private chainFor(state: StoredState, agentId: string, family: Family): { chain: Chain; record: AgentChain; index: number } | null {
+    if (!isChainFamily(family)) return null;
+    const found = chainOf(state, agentId);
+    if (!found) return null;
+    const index = placement(state, found.chain, found.record, family, Date.now());
+    return index === null ? null : { ...found, index };
+  }
+
+  /** What routing is told about the agent's chain step (see `RouteInput.step`). */
+  private stepInput(state: StoredState, agentId: string, family: Family): RouteInput["step"] {
+    const context = this.chainFor(state, agentId, family);
+    const step = context?.chain.steps[context.index];
+    if (!step) return undefined;
+    return step.source === "account" && step.accountId ? { kind: "account", accountId: step.accountId } : { kind: "pool" };
+  }
+
+  /** The chain's details for a timeline note about moving to step `index`. */
+  private chainNote(state: StoredState, chain: Chain, index: number, from: string | null, model: string | null = null): NonNullable<SwitchRow["chain"]> {
+    const step = chain.steps[index]!;
+    return { name: chain.name, step: index + 1, steps: chain.steps.length, label: stepLabel(state, step), model: model ?? step.model ?? null, from };
+  }
+
+  /** Moves an agent's chain record to `step` (as the furthest step reached), unless it changed meanwhile. */
+  private async setChainStep(agentId: string, chainId: string, step: number, manual = false): Promise<void> {
+    await this.store.update((draft) => {
+      const record = draft.agentChains[agentId];
+      if (record?.chainId === chainId) draft.agentChains[agentId] = { ...record, step, manual, at: new Date().toISOString() };
+    });
+  }
+
+  /** Gives an agent ZeroSub created to carry `from`'s work on the same chain, at `step`. */
+  private inheritChain(draft: StoredState, from: string, to: string, step: number | null, manual = false): void {
+    const record = draft.agentChains[from];
+    if (!record) return;
+    draft.agentChains[to] = { chainId: record.chainId, step: step ?? record.step, manual, at: new Date().toISOString() };
+  }
+
+  /**
+   * Records that `from`'s conversation goes on in `to`, and says so at the top of `to`'s timeline
+   * ("← Continued from …"). The note in `from` is its own switch note, which links forward. Once per
+   * pair: a reused tab or fork isn't told twice.
+   */
+  private async linkContinuation(paseo: PaseoApi, from: string, to: { agentId: string; title: string }): Promise<void> {
+    const state = await this.store.read();
+    if (state.links[to.agentId]?.previous?.agentId === from && state.links[from]?.next?.agentId === to.agentId) return;
+    const [source, target] = await Promise.all([lookUpWorkspace(paseo, from), lookUpWorkspace(paseo, to.agentId)]);
+    await this.store.update((draft) => {
+      draft.links[from] = { previous: draft.links[from]?.previous ?? null, next: { agentId: to.agentId, title: to.title, workspaceId: target.workspaceId } };
+      draft.links[to.agentId] = { next: draft.links[to.agentId]?.next ?? null, previous: { agentId: from, title: source.title ?? "the previous agent", workspaceId: source.workspaceId } };
+    });
+    const row: LinkRow = { direction: "from", agentId: from, title: source.title ?? "the previous agent", workspaceId: source.workspaceId, at: new Date().toISOString() };
+    try {
+      await paseo.agents.ref(to.agentId).timeline.append({ type: "plugin", id: `link-${from}`, kind: LINK_ROW_KIND, version: LINK_ROW_VERSION, data: row });
+    } catch (error) {
+      log(`could not add the back-link to ${to.agentId}`, error);
+    }
+  }
+
+  /**
+   * Walks an agent's chain on from the step whose account `account` just ran out: to the next step
+   * with room. One of its own family moves it in place (Claude) or to its continuation tab (ChatGPT);
+   * one of the other family forks the chat there, starting work at once, with the step's model and
+   * thinking and a mode no more permissive than its own. An agent no mode of the other provider is
+   * careful enough for (Claude's Plan Mode, Always Ask) skips the other family's steps. With no step
+   * left, it stops and says when the earliest frees up.
+   */
+  private async advanceChain(
+    paseo: PaseoApi,
+    agentId: string,
+    family: Family,
+    account: StoredAccount,
+    context: { chain: Chain; record: AgentChain; index: number },
+    timeline: readonly AgentTimelineItem[] | undefined,
+    reason: "limit" | "signed_out",
+    base: Omit<SwitchRow, "to" | "reason" | "outcome">,
+    endedAt: number,
+    now: number,
+  ): Promise<void> {
+    const { chain } = context;
+    const state = await this.store.read();
+    const current = stepOf(state, chain, account, context.index) ?? context.index;
+    const from = leavingText(state, chain.steps[current], account, reason);
+    const skipped: string[] = [];
+    let crossBlocked = false;
+    for (let index = current + 1; index < chain.steps.length; index += 1) {
+      const step = chain.steps[index]!;
+      if (isBroken(state, step)) {
+        skipped.push(`Step ${index + 1} names an account that was removed, so it was skipped.`);
+        continue;
+      }
+      if (!stepAvailable(state, step, now)) continue;
+      const target = stepFamily(state, step)!;
+      const note = (model: string | null = null) => this.chainNote(state, chain, index, from, model);
+      if (target === family) {
+        if (this.adapters[family].portable) {
+          await this.setChainStep(agentId, chain.id, index);
+          this.switchGuard.note(agentId, now);
+          const result = await this.reopenAgent(paseo, agentId, { settle: true });
+          const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
+          const landed = findAccount(await this.store.read(), (await this.store.read()).sessions[agentId]?.accountId);
+          await this.appendRow(paseo, agentId, {
+            ...base,
+            to: landed?.label ?? stepLabel(state, step),
+            reason,
+            continued,
+            outcome: result.outcome === "reopened" ? "switched" : "pending",
+            detail: result.outcome === "failed" ? failureDetail(result) : null,
+            chain: note(),
+          });
+          if (continued) await this.carryOn(paseo, agentId, endedAt);
+          return;
+        }
+        // A ChatGPT thread can't change accounts: the task goes on in its tab for the step's account.
+        const next = step.source === "account" ? stepAccount(state, step) : mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([account.id]), { lastResort: false });
+        if (!next || !HAND_OFF[family] || !this.prefs.autoContinue) continue;
+        try {
+          const continuation = await this.continueElsewhere(paseo, agentId, next, `its fallback chain “${chain.name}” moved on: ${from.toLowerCase()}`, timeline, "auto");
+          this.switchGuard.note(agentId, now);
+          await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, index));
+          await this.linkContinuation(paseo, agentId, continuation);
+          await this.appendRow(paseo, agentId, { ...base, to: next.label, reason, continued: true, continuedIn: continuation, outcome: "continued", detail: null, chain: note() });
+          return;
+        } catch (error) {
+          skipped.push(`Couldn't continue on ${next.label}: ${describe(error)}`);
+          continue;
+        }
+      }
+      if (crossBlocked) continue;
+      const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto", { chain, index }).catch((error: unknown) => ({
+        skipped: `Couldn't continue on ${FAMILY_LABEL[target]}: ${describe(error)}`,
+        mode: false,
+      }));
+      if ("fork" in result) {
+        this.switchGuard.note(agentId, now);
+        if (!result.reused) await this.linkContinuation(paseo, agentId, result.fork);
+        await this.appendRow(paseo, agentId, {
+          ...base,
+          to: result.account.label,
+          toFamily: result.family,
+          reason: "exhausted",
+          continued: true,
+          continuedIn: result.fork,
+          outcome: "continued",
+          detail: null,
+          chain: note(result.fork.model ?? null),
+        });
+        return;
+      }
+      if ("mode" in result && result.mode) crossBlocked = true;
+      skipped.push(result.skipped);
+    }
+    const free = earliestFree(state, chain, now);
+    await this.appendRow(paseo, agentId, {
+      ...base,
+      resetsAt: free ?? base.resetsAt,
+      to: account.label,
+      reason: "exhausted",
+      outcome: "stayed",
+      detail: [`Every later step of chain “${chain.name}” is out too${crossBlocked ? " or can't take this agent" : ""}.`, ...skipped].join(" "),
+      chain: { ...this.chainNote(state, chain, current, from), step: current + 1 },
+    });
+  }
+
+  /** The note's chain details for an agent going back to an earlier step of its chain; null without one. */
+  private returnNote(state: StoredState, agentId: string, target: string): SwitchRow["chain"] {
+    const to = findAccount(state, target);
+    const context = to ? this.chainFor(state, agentId, to.family) : null;
+    return context ? this.chainNote(state, context.chain, context.index, null) : null;
+  }
+
+  /** The chains as the app shows them, for `view`. */
+  private agentChainView(state: StoredState, agentId: string, family: Family): AgentChainView | null {
+    const context = this.chainFor(state, agentId, family);
+    if (!context) return null;
+    const step = context.chain.steps[context.index]!;
+    return {
+      chainId: context.chain.id,
+      name: context.chain.name,
+      step: context.index,
+      steps: context.chain.steps.length,
+      label: stepLabel(state, step),
+      manual: context.record.manual && context.index === context.record.step,
+    };
+  }
+
+  async saveChain(input: { id?: string; name: string; steps: ChainStep[] }): Promise<{ id: string }> {
+    const id = input.id ?? newChainId();
+    let problem: string | null = null;
+    await this.store.update((draft) => {
+      const existing = draft.chains.find((chain) => chain.id === id);
+      if (input.id && !existing) {
+        problem = "That chain no longer exists.";
+        return;
+      }
+      const chain: Chain = { id, name: input.name.trim(), steps: input.steps.map((step) => ({ ...step, accountId: step.source === "account" ? step.accountId : null, model: step.model?.trim() || null, thinking: step.thinking?.trim() || null })), auto: false };
+      problem = chainProblem(draft, chain);
+      if (problem) return;
+      if (existing) Object.assign(existing, chain);
+      else draft.chains.push(chain);
+      draft.chainsSeeded = true;
+      // Steps may have moved: agents start again from the first step of their family that has room.
+      for (const record of Object.values(draft.agentChains)) if (record.chainId === id) Object.assign(record, { step: 0, manual: false });
+    });
+    if (problem) throw new Error(problem);
+    console.log(`[ZeroSub] saved chain ${input.name}`);
+    return { id };
+  }
+
+  async deleteChain(id: string): Promise<void> {
+    await this.store.update((draft) => {
+      draft.chains = draft.chains.filter((chain) => chain.id !== id);
+      if (draft.defaultChain === id) draft.defaultChain = null;
+      draft.chainsSeeded = true;
+      // Agents that followed it have no chain now: they behave as without chains.
+      for (const record of Object.values(draft.agentChains)) if (record.chainId === id) Object.assign(record, { chainId: null, step: 0, manual: false });
+    });
+  }
+
+  async setDefaultChain(id: string | null): Promise<void> {
+    const state = await this.store.read();
+    if (id && !state.chains.some((chain) => chain.id === id)) throw new Error("That chain no longer exists.");
+    await this.store.update((draft) => {
+      draft.defaultChain = id;
+      draft.chainsSeeded = true;
+    });
+  }
+
+  /** `/chain <name>`, `/chain default`, `/chain off`, and the account button's chain menu. */
+  async setAgentChain(paseo: PaseoApi, agentId: string, mode: "chain" | "default" | "off", chainId?: string): Promise<{ chain: string | null }> {
+    this.attach(paseo);
+    const info = await lookUpAgent(paseo, agentId);
+    if (!info) throw new Error("That agent is no longer available.");
+    const family = (await this.families.resolve(paseo))[info.provider];
+    if (!family || !isChainFamily(family)) throw new Error("Fallback chains are for Claude and ChatGPT (Codex) agents.");
+    const state = await this.store.read();
+    const id = mode === "off" ? null : mode === "default" ? state.defaultChain : (chainId ?? null);
+    if (mode === "default" && !id) throw new Error("There's no default chain. Make one the default in Accounts → Chains.");
+    const chain = id ? state.chains.find((entry) => entry.id === id) : undefined;
+    if (id && !chain) throw new Error("That chain no longer exists.");
+    if (chain && !chain.steps.some((step) => stepFamily(state, step) === family)) {
+      throw new Error(`Chain “${chain.name}” has no ${FAMILY_LABEL[family]} step for this agent to run on.`);
+    }
+    await this.store.update((draft) => {
+      draft.agentChains[agentId] = { chainId: id, step: 0, manual: false, at: new Date().toISOString() };
+    });
+    console.log(`[ZeroSub] ${agentId} follows ${chain ? `chain ${chain.name}` : "no chain"}`);
+    // Its step's account may differ from where it runs: alignment moves it if it can't work there.
+    void this.alignSessions(paseo).catch(() => undefined);
+    return { chain: chain?.name ?? null };
   }
 
   /** Pins an agent to the account an automatic switch moved it to, unless the user picked one since `seen`. */
@@ -1714,9 +2031,12 @@ export class Service {
     family: Family,
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
-  ): Promise<{ fork: Continuation; account: StoredAccount; family: Family } | { skipped: string }> {
+    /** A fallback chain's step to fork to: its account (or its pool's roomiest subscription), model and thinking. */
+    chainTarget?: { chain: Chain; index: number },
+  ): Promise<{ fork: Continuation; account: StoredAccount; family: Family; reused: boolean } | { skipped: string; mode?: boolean }> {
     const other = OTHER_FAMILY[family];
     if (!other) return { skipped: `${FAMILY_LABEL[family]} agents don't carry on with another provider.` };
+    const step = chainTarget?.chain.steps[chainTarget.index];
     const name = FAMILY_LABEL[other];
     const families = await this.families.resolve(paseo);
     const state = await this.store.read();
@@ -1726,7 +2046,7 @@ export class Service {
     );
     const earlierAccount = earlier && (findAccount(state, state.bindings[earlier.id]?.accountId) ?? mainAccount(state, other));
     if (earlier && earlierAccount) {
-      return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, account: earlierAccount, family: other };
+      return { fork: { agentId: earlier.id, title: earlier.title ?? `${name} agent` }, account: earlierAccount, family: other, reused: true };
     }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
@@ -1735,8 +2055,11 @@ export class Service {
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
-    const account = mostAvailable(state, other, (id) => this.usage.get(id), Date.now(), new Set());
-    if (!account) return { skipped: `Every ${name} account is at its limit too.` };
+    const account =
+      step?.source === "account"
+        ? stepAccount(state, step)
+        : mostAvailable(state, other, (id) => this.usage.get(id), Date.now(), new Set(), step ? { lastResort: false } : {});
+    if (!account || !isUsable(account, Date.now())) return { skipped: `Every ${name} account is at its limit too.` };
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
     if (!original) throw new Error("That agent is no longer available.");
@@ -1749,6 +2072,7 @@ export class Service {
       const current = sourceModes.find((mode) => mode.id === original.currentModeId)?.label;
       return {
         skipped: `${name} has no mode as careful as this agent's${current ? ` (“${current}”)` : ""}, so ZeroSub didn't continue it there.`,
+        mode: true,
       };
     }
 
@@ -1758,7 +2082,7 @@ export class Service {
       timeline,
       why: source === "auto" ? `every ${FAMILY_LABEL[family]} account reached its usage limit` : `the work was moved to ${name}`,
       previous: PROVIDER_NAME[family],
-      target: { provider, label: name, modeId },
+      target: { provider, label: name, modeId, model: step?.model ?? null, thinkingOptionId: step?.thinking ?? null },
       parentId: await this.continuations.parentFor(paseo, agentId),
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
@@ -1767,11 +2091,14 @@ export class Service {
             source: source === "user" ? "user" : this.adapters[other].portable ? "auto" : "thread",
             at: new Date().toISOString(),
           };
+          // The fork follows the same chain, from the step it starts on; without one it has none.
+          if (chainTarget) this.inheritChain(draft, agentId, newAgentId, chainTarget.index);
+          else draft.agentChains[newAgentId] = { chainId: null, step: 0, manual: false, at: new Date().toISOString() };
         });
       },
     });
     console.log(`[ZeroSub] ${agentId} continues on ${name} (${account.label}) in ${fork.agentId}`);
-    return { fork, account, family: other };
+    return { fork: { ...fork, workspaceId: original.workspaceId ?? null }, account, family: other, reused: false };
   }
 
   /** "Continue on …" from an agent's account button: the same fork, asked for by the user. */
@@ -1819,9 +2146,15 @@ export class Service {
     if (info.status === "running" || info.status === "initializing") {
       throw new Error("This agent is working right now. Wait for its turn to finish, then continue it elsewhere.");
     }
-    const result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+    // On a chain, the fork goes to the first step of the other provider that has room.
+    const before = await this.store.read();
+    const context = this.chainFor(before, agentId, family);
+    const other = OTHER_FAMILY[family];
+    const index = context ? context.chain.steps.findIndex((step) => stepFamily(before, step) === other && stepAvailable(before, step, Date.now())) : -1;
+    const result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user", context && index >= 0 ? { chain: context.chain, index } : undefined);
     if ("skipped" in result) throw new Error(result.skipped);
     const state = await this.store.read();
+    if (!result.reused) await this.linkContinuation(paseo, agentId, result.fork);
     await this.appendRow(paseo, agentId, {
       family,
       from: findAccount(state, this.runningOn(state, agentId, family))?.label ?? null,
@@ -1882,6 +2215,7 @@ export class Service {
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,
+      step: this.stepInput(state, agentId, family),
     });
   }
 
@@ -2068,6 +2402,7 @@ export class Service {
           toFamily: null,
           outcome: "switched",
           detail: null,
+          chain: why === "room" ? this.returnNote(state, agentId, target) : null,
           at: new Date().toISOString(),
         };
         const result = await this.reopenAgent(paseo, agentId, { row, background: options.background });
@@ -2220,6 +2555,18 @@ export class Service {
     return Boolean(from && to && isLastResort(from) && !isLastResort(to));
   }
 
+  /**
+   * The agent's fallback chain has it back at an earlier step than the one its session runs on (a
+   * Bedrock account it fell back to, say, once another has room again): alignment moves it there.
+   */
+  private backOnChain(state: StoredState, agentId: string, from: StoredAccount, target: string): boolean {
+    const to = findAccount(state, target);
+    const context = to ? this.chainFor(state, agentId, to.family) : null;
+    if (!context || !to) return false;
+    const running = stepOf(state, context.chain, from);
+    return running !== null && context.index < running && stepOf(state, context.chain, to, context.index) === context.index;
+  }
+
   /** Why an agent's session no longer runs on the account it's routed to, for its timeline note. */
   private driftReason(state: StoredState, agentId: string, current: string, target: string, now: number): SwitchRow["reason"] {
     const from = findAccount(state, current);
@@ -2228,6 +2575,7 @@ export class Service {
     if (from.disabled) return "disabled";
     if (isLimited(from, now)) return "limit";
     if (this.leavesPaid(state, current, target)) return "room";
+    if (this.backOnChain(state, agentId, from, target)) return "room";
     return state.bindings[agentId]?.accountId === target ? "manual" : "default";
   }
 
@@ -2384,6 +2732,9 @@ export class Service {
         pendingAccountId: pending,
         waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
+        chain: this.agentChainView(state, agent.id, family),
+        chainOff: state.agentChains[agent.id]?.chainId === null,
+        ...(state.links[agent.id] ? { links: state.links[agent.id] } : {}),
       });
     }
 
@@ -2482,6 +2833,7 @@ export class Service {
       warnings: await this.warnings(),
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
       piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
+      chains: chainViews(state, now),
     };
   }
 
@@ -2756,6 +3108,18 @@ export class Service {
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
     if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
     if (accountId && this.prefs.autoSwitch && isLimited(target, Date.now())) throw new Error(limitedPick(target.label));
+    // On a fallback chain, a pick puts the agent at the matching step, where it stays (no return to an
+    // earlier step) until that step runs out. "Follow default" starts it from its first step again.
+    const context = this.chainFor(state, agentId, family);
+    const pickedStep = context && accountId ? stepOf(state, context.chain, target, context.index) : null;
+    if (context && accountId && pickedStep === null) {
+      throw new Error(
+        `${target.label} isn't a step of chain “${context.chain.name}”. Add it to the chain in Accounts → Chains, or turn the chain off for this agent with /chain off.`,
+      );
+    }
+    const placeOnChain = async (on: string) => {
+      if (context) await this.setChainStep(on, context.chain.id, pickedStep ?? 0, pickedStep !== null);
+    };
 
     if (!adapter.portable) {
       if (info.status === "running" || info.status === "initializing") {
@@ -2776,6 +3140,8 @@ export class Service {
             undefined,
             "user",
           ));
+          if (context) await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, pickedStep ?? 0, pickedStep !== null));
+          await this.linkContinuation(paseo, agentId, continuation);
           await this.appendRow(paseo, agentId, {
             family,
             from,
@@ -2813,6 +3179,7 @@ export class Service {
       }
     }
 
+    await placeOnChain(agentId);
     await this.store.update((draft) => {
       if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
       else delete draft.bindings[agentId];
@@ -4005,6 +4372,16 @@ async function lookUpAgent(paseo: PaseoApi, agentId: string): Promise<AgentInfo 
 }
 
 /** The agent, or null when it's gone or can't be looked up: for callers that then leave it alone. */
+/** An agent's title and workspace, for a link to it; nulls when Paseo can't say. */
+async function lookUpWorkspace(paseo: PaseoApi, agentId: string): Promise<{ title: string | null; workspaceId: string | null }> {
+  try {
+    const agent = (await paseo.agents.ref(agentId).refresh())?.agent as { title?: string | null; workspaceId?: string | null } | undefined;
+    return { title: agent?.title ?? null, workspaceId: agent?.workspaceId ?? null };
+  } catch {
+    return { title: null, workspaceId: null };
+  }
+}
+
 async function agentInfo(paseo: PaseoApi, agentId: string): Promise<AgentInfo | null> {
   return lookUpAgent(paseo, agentId).catch(() => null);
 }

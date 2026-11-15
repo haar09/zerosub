@@ -241,6 +241,10 @@ async function defaultModel(paseo: PaseoApi, provider: string): Promise<string |
 export interface Continuation {
   agentId: string;
   title: string;
+  /** The model the new agent started on, when ZeroSub chose it (a fork to the other provider). */
+  model?: string;
+  /** The workspace it's in, for a link to it. */
+  workspaceId?: string | null;
 }
 
 /** Another provider to continue on, instead of the source agent's own. */
@@ -251,6 +255,10 @@ export interface ContinuationTarget {
   label: string;
   /** A mode no more permissive than the source agent's. */
   modeId: string;
+  /** The model to start on (a fallback chain step's); the provider's default when absent. */
+  model?: string | null;
+  /** The thinking option to start with (a fallback chain step's); the provider's default when absent. */
+  thinkingOptionId?: string | null;
 }
 
 /**
@@ -295,7 +303,7 @@ export async function continueInNewAgent(options: {
   const { target } = options;
   const provider = target?.provider ?? source.provider;
   const model = target
-    ? await defaultModel(paseo, provider)
+    ? (target.model?.trim() || (await defaultModel(paseo, provider)))
     : (source.model ?? source.runtimeInfo?.model ?? (await defaultModel(paseo, provider)));
   if (!model) throw new Error(`Couldn't tell which ${provider} model to use for the new agent.`);
 
@@ -306,7 +314,7 @@ export async function continueInNewAgent(options: {
     : `${source.title?.trim() || "Codex task"} (continued)`;
   // Modes and thinking options are provider-specific: only carry them over within one provider.
   const config = target
-    ? { provider: `${provider}/${model}`, modeId: target.modeId }
+    ? { provider: `${provider}/${model}`, modeId: target.modeId, ...(target.thinkingOptionId ? { thinkingOptionId: target.thinkingOptionId } : {}) }
     : {
         provider: `${provider}/${model}`,
         ...(source.currentModeId ? { modeId: source.currentModeId } : {}),
@@ -323,5 +331,5 @@ export async function continueInNewAgent(options: {
   };
   if (source.workspaceId) await paseo.workspaces.ref(source.workspaceId).agents.create(request);
   else await paseo.agents.create({ ...request, cwd: source.cwd });
-  return { agentId, title };
+  return { agentId, title, ...(target ? { model } : {}) };
 }
