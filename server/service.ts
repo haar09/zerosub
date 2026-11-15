@@ -452,7 +452,11 @@ export class Service {
 
   /** Remember the plugin's SDK connection for background work (cleanup, failover). */
   attach(paseo: PaseoApi): void {
-    this.paseo ??= paseo;
+    if (this.paseo) return;
+    this.paseo = paseo;
+    // The first connection is the earliest moment the chains can be offered in Paseo's picker; the
+    // upkeep would otherwise wait for its next run.
+    if (this.started && !this.stopped) void this.syncChainProviders(paseo);
   }
 
   async start(): Promise<void> {
