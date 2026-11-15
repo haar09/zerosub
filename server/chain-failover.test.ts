@@ -98,7 +98,7 @@ async function setUp(options: Options) {
           ? { [AGENT]: { chainId: null, step: 0, at: new Date().toISOString() } }
           : { [AGENT]: { chainId: "work", step: options.record?.step ?? 0, manual: options.record?.manual ?? false, at: new Date().toISOString() } },
       sessions: { [AGENT]: { accountId: options.session ?? CLAUDE, family: "claude", openedAt: new Date(Date.now() - 60 * 60_000).toISOString() } },
-    } satisfies Partial<StoredState>),
+    } as unknown as Partial<StoredState>),
   );
   const source = {
     id: AGENT,
