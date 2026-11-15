@@ -5,8 +5,10 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from "../shared/format";
-import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type StateView } from "../shared/model";
-import { setAgentAccount } from "../shared/rpc";
+import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type AgentRoute, type StateView } from "../shared/model";
+import { chainSummary } from "../shared/chains";
+import { setAgentAccount, setAgentChain } from "../shared/rpc";
+import { LINKS_PANEL_ID } from "./agent-link";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
 import { stoppedWaiting, type ZeroSubStore } from "./store";
@@ -164,7 +166,9 @@ function buttonFor(
     current.status === "limited" &&
     accounts.every((account) => account.status === "limited" || account.status === "signed_out" || account.status === "disabled") &&
     state.accounts.some((account) => account.family === other && account.status === "ready");
-  if (accounts.length < 2 && !(current.status === "limited" && (offerReset || offerFork))) return null;
+  // An agent on a fallback chain with more than one step shows where it is in it, even with one account.
+  const onChain = Boolean(route?.chain && route.chain.steps > 1);
+  if (accounts.length < 2 && !onChain && !(current.status === "limited" && (offerReset || offerFork))) return null;
 
   const choose = (accountId: string | null, to: string) => async () => {
     const summary = await store.rpc(setAgentAccount, { agentId: agent.id, accountId }).catch((error: unknown) => {
@@ -232,6 +236,16 @@ function buttonFor(
       icon: "Info", disabled: true, behavior: { kind: "action", onPress() {} },
     });
   }
+  const chainMenu = chainEntry(store, state, agent, route);
+  if (chainMenu) items.push({ kind: "separator", id: "chain-divider" }, chainMenu);
+  const links = route?.links;
+  const openLinks = () => client.openPanel(LINKS_PANEL_ID, { workspaceId: agent.workspaceId, agentId: agent.id });
+  if (links?.next) {
+    items.push({ kind: "item", id: "link-next", title: `Continued in → ${links.next.title}`, icon: "Link", behavior: { kind: "action", onPress: openLinks } });
+  }
+  if (links?.previous) {
+    items.push({ kind: "item", id: "link-previous", title: `← Continued from ${links.previous.title}`, icon: "Link", behavior: { kind: "action", onPress: openLinks } });
+  }
   items.push({ kind: "separator", id: "manage-divider" });
   if (route?.pinned && movable) {
     const fallback = accounts.find((account) => account.isDefault);
@@ -257,9 +271,46 @@ function buttonFor(
   });
 
   const running = route?.pendingAccountId ? state.accounts.find((account) => account.id === route.pendingAccountId) : undefined;
+  const text = pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart"));
+  const chain = route?.chain;
   return {
-    ...pillText(current, running ?? null, route?.waiting ?? (state.canReopen ? "idle" : "restart")),
+    label: chain && onChain ? `${text.label} · ${chain.step + 1}/${chain.steps}` : text.label,
+    title: chain ? `${text.title} · ${chainSummary(chain)} (${chain.label})` : text.title,
     icon: current.status === "limited" ? "CircleAlert" : "CircleUserRound",
+    behavior: { kind: "menu", items },
+  };
+}
+
+/**
+ * "Chain: Work · step 2/4" with a submenu: each chain, the default one, or none. Only Claude and
+ * ChatGPT agents on a host that has chains get it.
+ */
+function chainEntry(store: ZeroSubStore, state: StateView, agent: TrackedAgent, route: AgentRoute | undefined): PluginButtonMenuEntry | null {
+  const family = state.providers[agent.provider];
+  if (!state.chains || (family !== "claude" && family !== "codex")) return null;
+  const chain = route?.chain ?? null;
+  const set = (input: { mode: "chain" | "default" | "off"; chainId?: string }) => async () => {
+    await store.rpc(setAgentChain, { agentId: agent.id, ...input });
+  };
+  const fallback = state.chains.find((entry) => entry.isDefault);
+  const items: PluginButtonMenuEntry[] = state.chains.map((entry, index) => ({
+    kind: "item",
+    id: `chain-${index}`,
+    title: entry.id === chain?.chainId ? `${entry.name} (step ${chain.step + 1}/${chain.steps}: ${chain.label})` : entry.name,
+    icon: entry.id === chain?.chainId ? "CircleCheck" : "Circle",
+    disabled: entry.id === chain?.chainId,
+    behavior: { kind: "action", onPress: set({ mode: "chain", chainId: entry.id }) },
+  }));
+  items.push({ kind: "separator", id: "chain-modes" });
+  if (fallback) {
+    items.push({ kind: "item", id: "chain-default", title: `Default chain (${fallback.name}), from its first step`, icon: "Undo2", behavior: { kind: "action", onPress: set({ mode: "default" }) } });
+  }
+  items.push({ kind: "item", id: "chain-off", title: "No chain (switch accounts as without chains)", icon: "CircleSlash", disabled: !chain && route?.chainOff === true, behavior: { kind: "action", onPress: set({ mode: "off" }) } });
+  return {
+    kind: "item",
+    id: "chain",
+    title: chain ? `${chainSummary(chain)} · ${chain.label}${chain.manual ? " (picked)" : ""}` : "Chain: none",
+    icon: "ListOrdered",
     behavior: { kind: "menu", items },
   };
 }
@@ -278,7 +329,11 @@ function menuTitle(account: AccountView): string {
 function menuKey(button: PluginButton): string {
   return button.behavior.kind === "menu"
     ? button.behavior.items
-        .map((item) => (item.kind === "item" ? `${item.id}:${item.title}:${String(item.icon)}:${item.disabled}` : item.id))
+        .map((item) =>
+          item.kind === "item"
+            ? `${item.id}:${item.title}:${String(item.icon)}:${item.disabled}:${item.behavior.kind === "menu" ? menuKey({ title: "", icon: "", behavior: item.behavior }) : ""}`
+            : item.id,
+        )
         .join("|")
     : "";
 }

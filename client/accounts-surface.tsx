@@ -15,6 +15,7 @@ import {
   setNextAgentAccount,
 } from "../shared/rpc";
 import { AddAccountModal } from "./add-account";
+import { ChainsSection } from "./chains";
 import { ApiUsage, AzureAccountModal, azureCardDetails } from "./azure-accounts";
 import { BedrockAccountModal, bedrockCardDetails } from "./bedrock-accounts";
 import { AddPiAccountModal, ApiKeyModal, PiSectionNotes, ProxyModal, piCardDetails } from "./pi-accounts";
@@ -134,6 +135,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
               />
             ))
           : null}
+
+        {state ? <ChainsSection theme={theme} state={state} store={store} compact={layout.compact} /> : null}
 
         <AutomationSettings theme={theme} />
       </ScrollView>
