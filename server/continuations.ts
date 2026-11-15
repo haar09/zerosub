@@ -305,7 +305,15 @@ export class CodexContinuations {
         ...(gathered.fallback ? { replaceHistory: gathered.obsolete } : {}),
         ...(destination.parent ? { parent: destination.parent } : {}),
       };
-      if (!destination.agent) draft.bindings[targetId] = { accountId: account.id, source: source === "user" ? "user" : "thread", at: new Date().toISOString() };
+      if (!destination.agent) {
+        const at = new Date().toISOString();
+        draft.bindings[targetId] = { accountId: account.id, source: source === "user" ? "user" : "thread", at };
+        // The tab opens on the source's provider, which may be a fallback chain's (see
+        // server/chain-providers.ts): it follows the source's chain, or none, never the one the
+        // provider or the default would give a new agent. A chain's move sets its step after.
+        const from = draft.agentChains[sourceAgentId];
+        draft.agentChains[targetId] ??= from ? { ...from, at } : { chainId: null, step: 0, manual: false, at };
+      }
     });
   }
 

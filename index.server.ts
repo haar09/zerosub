@@ -126,9 +126,9 @@ export default function contribute(server: PluginServerContext) {
   server.handle(updateBedrockAccount, async ({ accountId, ...input }) => ({ ok: true as const, ...(await service.updateBedrockAccount(accountId, input)) }));
   server.handle(setAccountProxy, async ({ accountId, proxy }) => ({ ok: true as const, proxy: await service.setProxy(accountId, proxy) }));
   server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
-  server.handle(saveChain, (input) => service.saveChain(input));
-  server.handle(deleteChain, async ({ id }) => {
-    await service.deleteChain(id);
+  server.handle(saveChain, (input, { paseo }) => service.saveChain(input, paseo));
+  server.handle(deleteChain, async ({ id }, { paseo }) => {
+    await service.deleteChain(id, paseo);
     return { ok: true as const };
   });
   server.handle(setDefaultChain, async ({ id }) => {

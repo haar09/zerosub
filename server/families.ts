@@ -91,7 +91,11 @@ export function familiesFromConfig(providers: Record<string, unknown> | undefine
     const entry = asRecord(value);
     const base = entry?.extends;
     if (!isFamily(base)) continue;
-    if (bringsOwnAuth(base, asRecord(entry?.env))) continue;
+    // Paseo runs it with the base provider's `env` under its own (see `mergeRuntimeSettings` in
+    // Paseo's provider registry), so credentials there count too. ZeroSub's chain providers
+    // (`zerosub-chain-…`, see server/chain-providers.ts) map like any other: ZEROSUB_CHAIN isn't one.
+    const inherited = { ...asRecord(asRecord(entries[base])?.env), ...asRecord(entry?.env) };
+    if (bringsOwnAuth(base, inherited)) continue;
     result[id] = base;
   }
   for (const [id, value] of Object.entries(entries)) {
@@ -107,6 +111,11 @@ const CACHE_MS = 30_000;
 /** Reads provider profiles from the daemon config, cached briefly because session opens are hot. */
 export class FamilyResolver {
   private cache: { at: number; value: Record<string, Family> } | null = null;
+
+  /** Forgets the cached map, after ZeroSub changed the provider entries itself. */
+  invalidate(): void {
+    this.cache = null;
+  }
 
   async resolve(paseo: PaseoApi): Promise<Record<string, Family>> {
     if (this.cache && Date.now() - this.cache.at < CACHE_MS) return this.cache.value;

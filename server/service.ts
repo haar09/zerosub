@@ -66,6 +66,7 @@ import {
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
+import { chainForProvider, isChainProviderId, planChainProviders, planChanges, providersInConfig } from "./chain-providers";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { CodexContinuations } from "./continuations";
 import { CONTINUED_FROM_LABEL, continueInNewAgent, type Continuation } from "./handoff";
@@ -165,6 +166,8 @@ const ALIGN_RETRY_MS = 30 * 60_000;
  * failover and waiting switches own it, and a reload would cancel a turn that is about to start.
  */
 const TURN_SETTLE_MS = 60_000;
+/** How often the chains' provider entries are checked against the daemon config (see `syncChainProviders`). */
+const CHAIN_PROVIDERS_MS = 5 * 60_000;
 /**
  * How long an RPC that moves agents or spends a reset waits for that before answering, since Paseo
  * gives up on an RPC after 30 s. The work carries on, and timeline notes and the state say how it went.
@@ -416,6 +419,8 @@ export class Service {
   private readonly cleanupFailures = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
+  /** The chains' provider entries: when they were last checked, the runs in order, and why the last one failed. */
+  private chainProviders: { at: number; queue: Promise<void>; error: string | null } = { at: 0, queue: Promise.resolve(), error: null };
   /** Startup's steps have all worked; until they have, each upkeep tries them again. See `startUp`. */
   private started = false;
   private starting: Promise<void> | null = null;
@@ -524,6 +529,7 @@ export class Service {
       }
     }
     await this.seedChains().catch((error: unknown) => log("could not seed the default chain", error));
+    if (this.paseo && now - this.chainProviders.at >= CHAIN_PROVIDERS_MS) void this.syncChainProviders(this.paseo);
     const state = await this.store.read();
     for (const account of state.accounts) {
       const attempted = this.usageAttemptAt.get(account.id) ?? 0;
@@ -871,7 +877,12 @@ export class Service {
     abandoned?: AbortSignal,
   ): Promise<PluginSessionOpenRequest | undefined> {
     this.attach(context.paseo);
-    const family = (await this.families.resolve(context.paseo))[request.provider];
+    let family = (await this.families.resolve(context.paseo))[request.provider];
+    if (!family && isChainProviderId(request.provider)) {
+      // A chain's provider entry written since the map was cached.
+      this.families.invalidate();
+      family = (await this.families.resolve(context.paseo))[request.provider];
+    }
     if (!family) return undefined;
     const adapter = this.adapters[family];
     const now = Date.now();
@@ -881,6 +892,17 @@ export class Service {
     if (reload) reload.opens += 1;
     const ownReload = reload?.opens === 1;
     let state = await this.store.read();
+    // A new agent created on a chain's provider (picked in Paseo's provider picker or an Agent
+    // profile, see server/chain-providers.ts) follows that chain from its first step, instead of the
+    // default one. One whose chain was deleted follows none.
+    const picked = request.reason === "create" && interactive && isChainFamily(family) ? chainForProvider(state, request.provider) : undefined;
+    if (picked && !state.agentChains[request.agentId]) {
+      const { chainId } = picked;
+      state = await this.store.update((draft) => {
+        draft.agentChains[request.agentId] ??= { chainId, step: 0, manual: false, at: new Date(now).toISOString() };
+      });
+      console.log(`[ZeroSub] ${request.agentId} follows ${chainId ? `chain ${chainId}` : "no chain (its chain was deleted)"}: created on ${request.provider}`);
+    }
     // A new agent of the user's own follows the default fallback chain from its first step. An
     // agent ZeroSub creates to carry work on already has its chain (see `inheritChain`).
     if (request.reason === "create" && isChainFamily(family) && takesNextPick(request) && state.defaultChain && !state.agentChains[request.agentId]) {
@@ -1696,9 +1718,55 @@ export class Service {
   /** Seeds the default chain on first run, and keeps a seeded, unedited chain in step with the accounts. */
   private async seedChains(): Promise<void> {
     if (!seedChains(structuredClone(await this.store.read()))) return;
+    // A seeded chain's steps (and so its provider entry's description) may change too.
+    this.chainProviders.at = 0;
     await this.store.update((draft) => {
       seedChains(draft);
     });
+  }
+
+  /**
+   * Offers each chain as a provider in Paseo's provider picker and Agent profiles: adds, updates and
+   * removes ZeroSub's `zerosub-chain-…` entries in the daemon config, and nothing else (see
+   * server/chain-providers.ts). An entry no chain offers any more stays while an agent (archived ones
+   * too), an Agent profile or metadata generation uses it, since Paseo can't reopen an agent whose
+   * provider is gone. Runs one at a time; never throws: a failure (a daemon that won't let plugins
+   * write its config, say) is logged and shown on the Accounts screen, and agents can still follow a
+   * chain by `/chain` and the account button.
+   */
+  syncChainProviders(paseo: PaseoApi): Promise<void> {
+    const run = this.chainProviders.queue.then(() => this.syncChainProvidersNow(paseo));
+    this.chainProviders.queue = run;
+    return run;
+  }
+
+  private async syncChainProvidersNow(paseo: PaseoApi): Promise<void> {
+    this.chainProviders.at = Date.now();
+    try {
+      const { config } = await paseo.config.get();
+      const raw = config as Record<string, unknown>;
+      const providers = raw.providers && typeof raw.providers === "object" ? (raw.providers as Record<string, unknown>) : {};
+      const state = await this.store.read();
+      let plan = planChainProviders(state, providers, null);
+      if (plan.kept.length > 0) {
+        // Only an entry that may be unused needs the agents listed; an incomplete list keeps them all.
+        const { agents, complete } = await listAgents(paseo, true);
+        if (complete) plan = planChainProviders(state, providers, new Set([...agents.map((agent) => agent.provider), ...providersInConfig(raw)]));
+      }
+      if (planChanges(plan)) {
+        await paseo.config.patch({ providers: plan.set, ...(plan.remove.length > 0 ? { removeProviders: plan.remove } : {}) });
+        this.families.invalidate();
+        const changed = Object.keys(plan.set);
+        console.log(
+          `[ZeroSub] chain providers: ${[changed.length > 0 ? `wrote ${changed.join(", ")}` : "", plan.remove.length > 0 ? `removed ${plan.remove.join(", ")}` : ""].filter(Boolean).join("; ")}`,
+        );
+      }
+      this.chainProviders.error = null;
+    } catch (error) {
+      const why = describe(error);
+      if (this.chainProviders.error !== why) log("could not offer the fallback chains as providers in Paseo's picker and Agent profiles", error);
+      this.chainProviders.error = why;
+    }
   }
 
   /** The chain an agent of `family` follows and the step it runs at now; null for none. */
@@ -1890,7 +1958,7 @@ export class Service {
     };
   }
 
-  async saveChain(input: { id?: string; name: string; steps: ChainStep[] }): Promise<{ id: string }> {
+  async saveChain(input: { id?: string; name: string; steps: ChainStep[]; picker?: boolean }, paseo?: PaseoApi): Promise<{ id: string }> {
     const id = input.id ?? newChainId();
     let problem: string | null = null;
     await this.store.update((draft) => {
@@ -1899,21 +1967,32 @@ export class Service {
         problem = "That chain no longer exists.";
         return;
       }
-      const chain: Chain = { id, name: input.name.trim(), steps: input.steps.map((step) => ({ ...step, accountId: step.source === "account" ? step.accountId : null, model: step.model?.trim() || null, thinking: step.thinking?.trim() || null })), auto: false };
+      const picker = input.picker ?? existing?.picker;
+      const chain: Chain = {
+        id,
+        name: input.name.trim(),
+        steps: input.steps.map((step) => ({ ...step, accountId: step.source === "account" ? step.accountId : null, model: step.model?.trim() || null, thinking: step.thinking?.trim() || null })),
+        auto: false,
+        ...(picker === false ? { picker: false } : {}),
+      };
       problem = chainProblem(draft, chain);
       if (problem) return;
-      if (existing) Object.assign(existing, chain);
-      else draft.chains.push(chain);
+      if (existing) {
+        Object.assign(existing, chain);
+        if (chain.picker === undefined) delete existing.picker;
+      } else draft.chains.push(chain);
       draft.chainsSeeded = true;
       // Steps may have moved: agents start again from the first step of their family that has room.
       for (const record of Object.values(draft.agentChains)) if (record.chainId === id) Object.assign(record, { step: 0, manual: false });
     });
     if (problem) throw new Error(problem);
     console.log(`[ZeroSub] saved chain ${input.name}`);
+    const connection = paseo ?? this.paseo;
+    if (connection) await this.syncChainProviders(connection);
     return { id };
   }
 
-  async deleteChain(id: string): Promise<void> {
+  async deleteChain(id: string, paseo?: PaseoApi): Promise<void> {
     await this.store.update((draft) => {
       draft.chains = draft.chains.filter((chain) => chain.id !== id);
       if (draft.defaultChain === id) draft.defaultChain = null;
@@ -1921,6 +2000,9 @@ export class Service {
       // Agents that followed it have no chain now: they behave as without chains.
       for (const record of Object.values(draft.agentChains)) if (record.chainId === id) Object.assign(record, { chainId: null, step: 0, manual: false });
     });
+    // Its provider entry goes, or stays marked deleted while agents or profiles use it.
+    const connection = paseo ?? this.paseo;
+    if (connection) await this.syncChainProviders(connection);
   }
 
   async setDefaultChain(id: string | null): Promise<void> {
@@ -2053,7 +2135,9 @@ export class Service {
     }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
-    const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other);
+    // The built-in provider, or a profile of the user's that runs it; never a chain's provider entry,
+    // whose own chain would be bound to the fork (the fork follows this agent's chain, set below).
+    const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other && !isChainProviderId(id));
     const available = provider
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
@@ -2837,6 +2921,7 @@ export class Service {
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
       piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(piHomesNow), isDefault: state.piHomes.dir === null } : null,
       chains: chainViews(state, now),
+      chainProvidersError: this.chainProviders.error,
     };
   }
 

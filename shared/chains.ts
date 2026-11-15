@@ -31,6 +31,11 @@ export const ChainSchema = z.object({
    * Azure account is added at the end). Saving it in the editor makes it the user's own.
    */
   auto: z.boolean().default(false),
+  /**
+   * Offered as a provider in Paseo's provider picker and Agent profiles (see server/chain-providers.ts).
+   * Absent means yes.
+   */
+  picker: z.boolean().optional(),
 });
 export type Chain = z.infer<typeof ChainSchema>;
 
@@ -50,6 +55,10 @@ export const ChainViewSchema = z.object({
   isDefault: z.boolean(),
   auto: z.boolean(),
   steps: z.array(ChainStepViewSchema),
+  /** Offered in Paseo's provider picker and Agent profiles; absent (an older server) means yes. */
+  picker: z.boolean().optional(),
+  /** The provider it's offered as, e.g. `⛓ Work`; null when it isn't (hidden, or no step to start on). */
+  provider: z.object({ id: z.string(), label: z.string() }).nullable().optional(),
 });
 export type ChainView = z.infer<typeof ChainViewSchema>;
 

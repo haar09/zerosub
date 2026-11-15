@@ -75,6 +75,12 @@ interface Options {
   record?: { step: number; manual?: boolean } | "off";
   accounts?: Partial<Record<string, Record<string, unknown>>>;
   session?: string;
+  /** Provider entries in the daemon config, and the families they map to besides the built-in ones. */
+  providers?: Record<string, Record<string, unknown>>;
+  families?: Record<string, "claude" | "codex">;
+  profiles?: Array<{ id: string; name: string; provider: string }>;
+  /** The daemon refuses config patches. */
+  readOnlyConfig?: boolean;
 }
 
 async function setUp(options: Options) {
@@ -115,12 +121,31 @@ async function setUp(options: Options) {
   const agents: Array<Record<string, unknown>> = [source];
   const created: Array<{ agentId: string; config: { provider: string; modeId?: string; thinkingOptionId?: string }; title: string; prompt: string; labels: Record<string, string> }> = [];
   const notes: Array<{ agentId: string; kind: string; data: Record<string, unknown> }> = [];
+  const config: { providers: Record<string, Record<string, unknown>>; agentProfiles: unknown[] } = {
+    providers: structuredClone(options.providers ?? {}),
+    agentProfiles: options.profiles ?? [],
+  };
+  const patches: Array<Record<string, unknown>> = [];
   const paseo = {
-    config: { get: async () => ({ config: { providers: {} } }) },
+    config: {
+      get: async () => ({ config: structuredClone(config) }),
+      // Like Paseo's daemon: each entry given is merged into what's there; `removeProviders` drops entries.
+      patch: async (patch: { providers?: Record<string, Record<string, unknown>>; removeProviders?: string[] }) => {
+        if (options.readOnlyConfig) throw new Error("EACCES: permission denied, open '/home/u/.paseo/config.json'");
+        patches.push(structuredClone(patch));
+        for (const id of patch.removeProviders ?? []) delete config.providers[id];
+        for (const [id, entry] of Object.entries(patch.providers ?? {})) config.providers[id] = { ...config.providers[id], ...entry };
+        return { config: structuredClone(config) };
+      },
+    },
     providers: {
-      listAvailable: async () => ({ providers: [{ provider: "claude", available: true }, { provider: "codex", available: true }] }),
-      listModes: async (provider: string) => ({ modes: MODES[provider] }),
-      listModels: async (provider: string) => ({ models: [{ id: provider === "codex" ? "gpt-5.6-sol" : "claude-opus-5-5", isDefault: true }] }),
+      listAvailable: async () => ({
+        providers: ["claude", "codex", ...Object.keys(options.families ?? {})].map((provider) => ({ provider, available: true })),
+      }),
+      listModes: async (provider: string) => ({ modes: MODES[{ claude: "claude", codex: "codex", ...options.families }[provider] ?? provider] }),
+      listModels: async (provider: string) => ({
+        models: [{ id: ({ codex: "codex", ...options.families }[provider] ?? provider) === "codex" ? "gpt-5.6-sol" : "claude-opus-5-5", isDefault: true }],
+      }),
     },
     workspaces: {
       ref: () => ({
@@ -156,7 +181,7 @@ async function setUp(options: Options) {
   service = new Service(
     { claude: adapter("claude", true), codex: adapter("codex", false), pi: absentPi() },
     store,
-    { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const }) } as unknown as FamilyResolver,
+    { resolve: async () => ({ claude: "claude" as const, codex: "codex" as const, ...options.families }), invalidate: () => undefined } as unknown as FamilyResolver,
     reopener as unknown as Reopener,
   );
   services.push(service);
@@ -166,7 +191,7 @@ async function setUp(options: Options) {
       context,
     );
   const rows = (agentId = AGENT) => notes.filter((note) => note.agentId === agentId && note.kind === "zerosub-switch").map((note) => note.data);
-  return { service, store, paseo, created, notes, rows, limitTurn, context };
+  return { service, store, paseo, created, notes, rows, limitTurn, context, config, patches, agents };
 }
 
 describe("fallback chains", () => {
@@ -322,4 +347,115 @@ describe("fallback chains", () => {
     const narrow = await setUp({ steps: [pool("claude")] });
     await expect(narrow.service.setAgentAccount(narrow.paseo as never, AGENT, BEDROCK)).rejects.toThrow(/isn't a step of chain “Work”/);
   });
+
+  it("binds the chain of the provider a new agent was created on, over the default, and /chain still works", async () => {
+    const chainProvider = "zerosub-chain-other-claude";
+    const { service, store, context, paseo, agents } = await setUp({ steps: [pool("claude"), api(BEDROCK)], families: { [chainProvider]: "claude" } });
+    await store.update((draft) => {
+      draft.chains.push({ id: "other", name: "Other", steps: [pool("claude"), pool("codex")], auto: false });
+    });
+    await service.onSessionOpen({ agentId: "picked", provider: chainProvider, reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, context);
+    // Picked explicitly, so it counts outside a workspace too (`paseo run --provider …`).
+    await service.onSessionOpen({ agentId: "cli", provider: chainProvider, reason: "create", purpose: "interactive", env: {} } as never, context);
+    let state = await store.read();
+    expect(state.agentChains.picked).toMatchObject({ chainId: "other", step: 0 });
+    expect(state.agentChains.cli).toMatchObject({ chainId: "other", step: 0 });
+    expect(state.sessions.picked?.accountId).toBe(CLAUDE);
+
+    // Reopening doesn't bind it again: `/chain off` sticks.
+    agents.push({ id: "picked", provider: chainProvider, status: "idle", workspaceId: "ws-1", archivedAt: null, labels: {} });
+    expect(await service.setAgentChain(paseo as never, "picked", "off")).toEqual({ chain: null });
+    await service.onSessionOpen({ agentId: "picked", provider: chainProvider, reason: "resume", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, context);
+    state = await store.read();
+    expect(state.agentChains.picked?.chainId).toBeNull();
+    expect(await service.setAgentChain(paseo as never, "picked", "chain", "work")).toEqual({ chain: "Work" });
+  });
+
+  it("gives no chain to a new agent on a deleted chain's provider", async () => {
+    const chainProvider = "zerosub-chain-gone-claude";
+    const { service, store, context } = await setUp({ steps: [pool("claude")], families: { [chainProvider]: "claude" } });
+    await service.onSessionOpen({ agentId: "late", provider: chainProvider, reason: "create", purpose: "interactive", workspaceId: "ws-1", env: {} } as never, context);
+    expect((await store.read()).agentChains.late).toMatchObject({ chainId: null });
+  });
+
+  it("forks to the other family's own provider, never a chain's provider entry", async () => {
+    const families = { "zerosub-chain-work-claude": "claude", "zerosub-chain-work-codex": "codex" } as const;
+    const { created, store, limitTurn } = await setUp({ steps: [pool("claude"), pool("codex")], families });
+    await limitTurn();
+    expect(created[0]?.config.provider).toBe("codex/gpt-5.6-sol");
+    expect((await store.read()).agentChains[created[0]!.agentId]).toMatchObject({ chainId: "work", step: 1 });
+
+    // With Codex's own entry bringing its own key, a profile of the user's that runs Codex is next.
+    const own = await setUp({
+      steps: [pool("claude"), pool("codex")],
+      families: { codex: undefined as unknown as "codex", "zerosub-chain-work-codex": "codex", "my-codex": "codex" },
+    });
+    await own.limitTurn();
+    expect(own.created[0]?.config.provider).toBe("my-codex/gpt-5.6-sol");
+  });
 });
+
+describe("chains as Paseo providers", () => {
+  const userEntry = { extends: "claude", label: "Claude (work proxy)", env: { HTTPS_PROXY: "http://proxy:8080" } };
+
+  it("publishes each chain, keeps the user's entries, and does nothing when it's all in place", async () => {
+    const { service, paseo, config, patches } = await setUp({ steps: [pool("claude"), pool("codex")], providers: { "claude-work": userEntry } });
+    await service.syncChainProviders(paseo as never);
+    expect(config.providers["claude-work"]).toEqual(userEntry);
+    expect(config.providers["zerosub-chain-work-claude"]).toEqual({
+      extends: "claude",
+      label: "⛓ Work",
+      description: "ZeroSub fallback chain: Claude subscription → ChatGPT subscription",
+      env: { ZEROSUB_CHAIN: "work" },
+    });
+    expect(patches).toHaveLength(1);
+    expect(Object.keys(patches[0]!.providers as object)).toEqual(["zerosub-chain-work-claude"]);
+    await service.syncChainProviders(paseo as never);
+    expect(patches).toHaveLength(1);
+  });
+
+  it("follows renames, the picker toggle and deletion; keeps an entry an agent still uses, marked deleted", async () => {
+    const { service, store, paseo, config, agents } = await setUp({ steps: [pool("claude"), pool("codex")] });
+    await service.syncChainProviders(paseo as never);
+    const { id } = await service.saveChain({ id: "work", name: "Day job", steps: [pool("claude"), pool("codex")] }, paseo as never);
+    expect(config.providers["zerosub-chain-work-claude"]?.label).toBe("⛓ Day job");
+
+    // A new chain, hidden from the picker: no entry. Shown again: there it is.
+    const { id: hidden } = await service.saveChain({ name: "Night", steps: [pool("codex")], picker: false }, paseo as never);
+    expect(Object.keys(config.providers)).toEqual(["zerosub-chain-work-claude"]);
+    expect((await store.read()).chains.find((chain) => chain.id === hidden)?.picker).toBe(false);
+    await service.saveChain({ id: hidden, name: "Night", steps: [pool("codex")], picker: true }, paseo as never);
+    expect(config.providers[`zerosub-chain-${hidden}-codex`]).toMatchObject({ extends: "codex", label: "⛓ Night" });
+    // Saving without saying keeps the choice.
+    await service.saveChain({ id: hidden, name: "Night", steps: [pool("codex")] }, paseo as never);
+    expect(config.providers[`zerosub-chain-${hidden}-codex`]).toBeDefined();
+
+    // An agent (archived even) on the chain's provider keeps the entry once the chain is deleted.
+    agents.push({ id: "on-chain", provider: "zerosub-chain-work-claude", status: "closed", archivedAt: "2026-11-01T00:00:00Z", labels: {} });
+    await service.deleteChain(id, paseo as never);
+    expect(config.providers["zerosub-chain-work-claude"]).toMatchObject({ extends: "claude", label: "⛓ Day job (deleted)" });
+    agents.pop();
+    await service.syncChainProviders(paseo as never);
+    expect(config.providers["zerosub-chain-work-claude"]).toBeUndefined();
+  });
+
+  it("keeps the old family's entry while a profile uses it when the first step moves to the other provider", async () => {
+    const profiles = [{ id: "p", name: "Work", provider: "zerosub-chain-work-claude" }];
+    const { service, paseo, config } = await setUp({ steps: [pool("claude"), pool("codex")], profiles });
+    await service.syncChainProviders(paseo as never);
+    await service.saveChain({ id: "work", name: "Work", steps: [pool("codex"), pool("claude")] }, paseo as never);
+    expect(config.providers["zerosub-chain-work-codex"]).toMatchObject({ extends: "codex", label: "⛓ Work" });
+    expect(config.providers["zerosub-chain-work-claude"]).toMatchObject({ extends: "claude", label: "⛓ Work · Claude" });
+    profiles.length = 0;
+    await service.syncChainProviders(paseo as never);
+    expect(config.providers["zerosub-chain-work-claude"]).toBeUndefined();
+  });
+
+  it("says so when the daemon won't let it write its config, and saving a chain still works", async () => {
+    const { service, store, paseo } = await setUp({ steps: [pool("claude")], readOnlyConfig: true });
+    await service.saveChain({ name: "Other", steps: [pool("codex")] }, paseo as never);
+    expect((await store.read()).chains.map((chain) => chain.name)).toEqual(["Work", "Other"]);
+    expect((service as unknown as { chainProviders: { error: string | null } }).chainProviders.error).toMatch(/EACCES/);
+  });
+});
+

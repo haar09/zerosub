@@ -269,6 +269,8 @@ export const saveChain = defineRpc({
     id: z.string().optional(),
     name: z.string().trim().min(1).max(40),
     steps: z.array(ChainStepSchema).min(1).max(MAX_CHAIN_STEPS),
+    /** Offer it as a provider in Paseo's provider picker and Agent profiles; absent keeps what it was (new: yes). */
+    picker: z.boolean().optional(),
   }),
   output: z.object({ id: z.string() }),
 });

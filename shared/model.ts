@@ -459,5 +459,10 @@ export const StateViewSchema = z.object({
   warnings: z.array(z.string()),
   /** Fallback chains (this fork); absent from servers without them. */
   chains: z.array(ChainViewSchema).optional(),
+  /**
+   * Why ZeroSub couldn't offer the chains as providers in Paseo's picker and Agent profiles (it
+   * can't write the daemon config, say); null when it could or hasn't tried yet.
+   */
+  chainProvidersError: z.string().nullable().optional(),
 });
 export type StateView = z.infer<typeof StateViewSchema>;

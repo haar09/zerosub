@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { MAX_CHAIN_STEPS, POOL_LABEL, type Chain, type ChainStep, type ChainStepView, type ChainView } from "../shared/chains";
 import { FAMILY_LABEL, isAzureAccount, isBedrockAccount, isPaidFallback, type Family } from "../shared/model";
+import { publishedEntry } from "./chain-providers";
 import { canStandIn, isUsable } from "./routing";
 import { accountsOf, findAccount, type AgentChain, type StoredAccount, type StoredState } from "./state";
 
@@ -179,6 +180,11 @@ export function chainViews(state: StoredState, now: number): ChainView[] {
     name: chain.name,
     isDefault: state.defaultChain === chain.id,
     auto: chain.auto,
+    picker: chain.picker !== false,
+    provider: (() => {
+      const published = publishedEntry(state, chain);
+      return published ? { id: published.id, label: published.entry.label } : null;
+    })(),
     steps: chain.steps.map((step): ChainStepView => {
       const family = stepFamily(state, step);
       return {
