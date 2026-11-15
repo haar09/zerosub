@@ -8,7 +8,7 @@ import { accountPeak, formatCredits, formatPercent, moveProblem, pillText } from
 import { FAMILY_LABEL, HAND_OFF, OTHER_FAMILY, type AccountView, type AgentRoute, type StateView } from "../shared/model";
 import { chainSummary } from "../shared/chains";
 import { setAgentAccount, setAgentChain } from "../shared/rpc";
-import { LINKS_PANEL_ID } from "./agent-link";
+import { LINKS_PANEL_ID } from "./panel-ids";
 import { forkPopover } from "./fork-confirm";
 import { resetPopover } from "./reset-confirm";
 import { stoppedWaiting, type ZeroSubStore } from "./store";

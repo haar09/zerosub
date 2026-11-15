@@ -7,7 +7,8 @@ import { useStore, type ZeroSubStore } from "./store";
 import { Button, Card, useText } from "./ui";
 
 /** The agent panel that opens a linked agent when the timeline can't (see `openLinked`). */
-export const LINKS_PANEL_ID = "linked-agents";
+export { LINKS_PANEL_ID } from "./panel-ids";
+import { LINKS_PANEL_ID } from "./panel-ids";
 
 type Navigation = { openAgent?(input: { agentId: string; serverId?: string }): void };
 
