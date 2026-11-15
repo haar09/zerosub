@@ -216,6 +216,17 @@ On first run ZeroSub seeds a chain called **Default**: Claude subscription → C
 - `/chain <name>`, `/chain default`, `/chain off` in its message box do the same. **Off** is exactly the behavior without chains: the **fork to the other provider** toggle and the Bedrock/Azure last-resort rule apply again.
 - **Picking an account by hand** (the account button, `/account`) puts the agent at that account's step: a subscription account at its provider's subscription step, a Bedrock or Azure account at its own step. The agent then stays at that step, without returning to an earlier one, until the step runs out; from there the chain goes on as usual. An account that has no step in the agent's chain is refused, with a hint to add it or use `/chain off`. **Follow default** puts it back at the first step.
 
+**Using a chain in an Agent profile.** Paseo's Agent profiles (and its model picker) choose a provider, and plugins can't add fields to them, so ZeroSub offers every chain as a provider of its own, labelled with ⛓ and the chain's name:
+
+1. Under **Chains**, make or edit a chain; leave **Show in model picker and Agent profiles** on (it is by default). Its card then says `In the model picker and Agent profiles: “⛓ Work”`.
+2. In Paseo, **Settings → host → Agents → Agent profiles**, add or edit a profile and pick **⛓ Work** as its provider. Its model list is the one of the chain's first provider (Claude's models when the chain starts with a Claude step, ChatGPT's when it starts with ChatGPT or Azure); pick the model, mode, thinking and features as for that provider.
+3. Start an agent from that profile (or pick **⛓ Work** in the model picker). It follows **Work** from its first step, whatever the default chain, on the profile's model; the first step's own model only applies to agents the chain creates. ZeroSub switches its accounts exactly as on the built-in provider, and `/chain` and the account button's chain menu work on it as usual.
+
+How it works: each chain is a custom provider entry in the daemon config (`agents.providers` in `config.json`), ID `zerosub-chain-<chain>-<claude|codex>`, that `extends` the provider of the chain's first step and sets `ZEROSUB_CHAIN` in its environment. ZeroSub only ever adds, changes or removes entries with that prefix; other settings you add to one (extra models, `enabled: false`) are kept. It checks them when it starts, every 5 minutes and when you save or delete a chain. Forks to the other provider open on Paseo's own provider for it (a ChatGPT continuation tab stays on its agent's provider, as always) and keep following the chain.
+
+- **Deleting a chain, hiding it, or moving its first step to the other provider** takes its entry out of the picker, except while an agent (archived ones too), an Agent profile or Paseo's metadata generation still uses it, since Paseo can't reopen an agent whose provider is gone. Until then it stays as `⛓ Work (deleted)`, or `⛓ Work · Claude` for the old provider of a chain that now starts with ChatGPT (agents started on that one follow the chain from its first Claude step). Agents on a deleted chain's entry keep running on its provider without a chain; a profile pointing at it needs a new provider.
+- If the daemon won't let plugins write its config, the Chains section says so; agents can still follow chains by default, `/chain` and the account button.
+
 **How an agent moves along it.** A step runs out when every account of its subscription pool is at its limit, disabled or signed out, or when its Bedrock/Azure account is cooling down after a rate limit or quota error, or was refused. Within a subscription step, a turn that hits a limit first moves to another account of the pool as before (and **Use banked resets when every account is out** still spends a reset first, when it's on). Once the step is out, the agent goes to the next step with room:
 
 - **Same provider** (Claude subscription → Bedrock, ChatGPT subscription → Azure): a Claude agent moves in place; a ChatGPT agent carries on in its continuation tab for that account.
@@ -233,6 +244,7 @@ On a chain, the chain's order replaces both the **fork to the other provider** t
 
 - A chain is walked forward from the agent's step: a ChatGPT agent on the seeded chain never goes "back" to the Claude subscription step before it.
 - The step's model and thinking only apply to agents the chain creates (forks); a ChatGPT continuation tab keeps the original's model, so Azure deployments still need the model's name.
+- The chain providers rely on Paseo's config API (`config.patch` of `providers` and `removeProviders`) and its `extends` providers, as in Paseo 0.15; the session-open hook doesn't name the Agent profile used, so the chain comes from the provider.
 - Tested with unit tests and type checks, not yet against a live Paseo daemon.
 
 Install this fork (Azure, Bedrock and fallback chains) on a Paseo host with `paseo plugin install github:haar09/zerosub --ref chains` (remove the upstream `zerosub` plugin first if it's installed: both use the id `zerosub`).
