@@ -1873,17 +1873,20 @@ export class Service {
   }
 
   /** The chains as the app shows them, for `view`. */
-  private agentChainView(state: StoredState, agentId: string, family: Family): AgentChainView | null {
+  private agentChainView(state: StoredState, agentId: string, family: Family, accountId: string): AgentChainView | null {
     const context = this.chainFor(state, agentId, family);
     if (!context) return null;
-    const step = context.chain.steps[context.index]!;
+    // A ChatGPT thread stays on the account holding it, whatever step the chain would have it at.
+    const routed = findAccount(state, accountId);
+    const index = (routed && stepOf(state, context.chain, routed, context.index)) ?? context.index;
+    const step = context.chain.steps[index]!;
     return {
       chainId: context.chain.id,
       name: context.chain.name,
-      step: context.index,
+      step: index,
       steps: context.chain.steps.length,
       label: stepLabel(state, step),
-      manual: context.record.manual && context.index === context.record.step,
+      manual: context.record.manual && index === context.record.step,
     };
   }
 
@@ -2732,7 +2735,7 @@ export class Service {
         pendingAccountId: pending,
         waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
-        chain: this.agentChainView(state, agent.id, family),
+        chain: this.agentChainView(state, agent.id, family, accountId),
         chainOff: state.agentChains[agent.id]?.chainId === null,
         ...(state.links[agent.id] ? { links: state.links[agent.id] } : {}),
       });
