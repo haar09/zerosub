@@ -1,7 +1,8 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { describeReopen, limitedPick, moveProblem } from "../shared/format";
 import { FAMILY_LABEL, type AccountView, type StateView } from "../shared/model";
-import { setAgentAccount, setDefaultAccount, setNextAgentAccount, type ReopenSummary } from "../shared/rpc";
+import { findChain } from "../shared/chains";
+import { setAgentAccount, setAgentChain, setDefaultAccount, setNextAgentAccount, type ReopenSummary } from "../shared/rpc";
 import { stoppedWaiting, type ZeroSubStore } from "./store";
 
 /** Command Center entries and the `/account` slash command. */
@@ -55,6 +56,40 @@ export function contributeCommands(client: PluginClientContext, store: ZeroSubSt
         if (match.status === "disabled") throw new Error(`${match.label} is disabled. Enable it in Accounts first.`);
         if (match.status === "limited" && state.autoSwitch) throw new Error(limitedPick(match.label));
         await move(match.id, match.label);
+      },
+    }),
+  );
+
+  removers.push(
+    client.addSlashCommand({
+      name: "chain",
+      description: "Set the fallback chain this agent follows (ZeroSub)",
+      argumentHint: "[name | default | off]",
+      context: "agent",
+      async onSubmit({ args, agent, openSurface }) {
+        const state = await currentState(store);
+        const family = state.providers[agent.provider];
+        if (family !== "claude" && family !== "codex") throw new Error("Fallback chains are for Claude and ChatGPT (Codex) agents.");
+        if (!state.chains) throw new Error("This host's ZeroSub doesn't have fallback chains.");
+        const query = args.trim();
+        if (!query) {
+          openSurface("accounts");
+          return;
+        }
+        if (/^off$/i.test(query)) {
+          await store.rpc(setAgentChain, { agentId: agent.id, mode: "off" });
+          return;
+        }
+        if (/^default$/i.test(query)) {
+          await store.rpc(setAgentChain, { agentId: agent.id, mode: "default" });
+          return;
+        }
+        const match = findChain(state.chains, query);
+        if (!match) {
+          const names = state.chains.map((chain) => chain.name).join(", ");
+          throw new Error(`No chain matches "${query}". Chains: ${names || "none"}. Or use /chain default or /chain off.`);
+        }
+        await store.rpc(setAgentChain, { agentId: agent.id, mode: "chain", chainId: match.id });
       },
     }),
   );

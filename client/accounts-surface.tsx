@@ -18,6 +18,7 @@ import { AddAccountModal } from "./add-account";
 import { ApiAccountModal } from "./api-account";
 import { AzureAccountModal, AzureUsage, azureCardDetails } from "./azure-account";
 import { BedrockAccountModal, BedrockUsage, bedrockCardDetails } from "./bedrock-account";
+import { ChainsSection } from "./chains";
 import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 import { AddPiAccountModal, ApiKeyModal, HomesHint, PiSectionNotes, ProxyModal, ShellHint, piCardDetails } from "./pi-accounts";
 import { ResetConfirm, redeemToast, resetBadge } from "./reset-confirm";
@@ -136,6 +137,8 @@ export function AccountsSurface(props: PluginSurfaceProps & { store: ZeroSubStor
               />
             ))
           : null}
+
+        {state ? <ChainsSection theme={theme} state={state} store={store} compact={layout.compact} /> : null}
 
         <AutomationSettings theme={theme} compact={layout.compact} />
       </ScrollView>
