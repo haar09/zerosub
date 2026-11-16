@@ -32,6 +32,10 @@ import {
   updateAzureAccount,
   updateBedrockAccount,
   detectBedrockRegion,
+  saveChain,
+  deleteChain,
+  setDefaultChain,
+  setAgentChain,
 } from "./shared/rpc";
 
 export default function contribute(server: PluginServerContext) {
@@ -129,6 +133,16 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setClaudeHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setClaudeHomesDir(dir)) }));
   server.handle(importAccount, async ({ path }) => ({ accountId: await service.importAccount(path) }));
   server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
+  server.handle(saveChain, (input, { paseo }) => service.saveChain(input, paseo));
+  server.handle(deleteChain, async ({ id }, { paseo }) => {
+    await service.deleteChain(id, paseo);
+    return { ok: true as const };
+  });
+  server.handle(setDefaultChain, async ({ id }) => {
+    await service.setDefaultChain(id);
+    return { ok: true as const };
+  });
+  server.handle(setAgentChain, async ({ agentId, mode, chainId }, { paseo }) => ({ ok: true as const, ...(await service.setAgentChain(paseo, agentId, mode, chainId)) }));
   server.handle(importPiAccount, async ({ path }) => ({ accountId: await service.importPiAccount(path) }));
 
   return async () => {

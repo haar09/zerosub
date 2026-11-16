@@ -37,7 +37,25 @@ import {
 import { capsAccount, limitedPick } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
 import type { RedeemResult, ReopenSummary } from "../shared/rpc";
-import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
+import { LINK_ROW_KIND, LINK_ROW_VERSION, SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type LinkRow, type SwitchRow } from "../shared/timeline";
+import type { AgentChainView, Chain, ChainStep } from "../shared/chains";
+import {
+  chainOf,
+  chainProblem,
+  chainViews,
+  earliestFree,
+  isBroken,
+  isChainFamily,
+  leavingText,
+  newChainId,
+  placement,
+  seedChains,
+  stepAccount,
+  stepAvailable,
+  stepFamily,
+  stepLabel,
+  stepOf,
+} from "./chains";
 import {
   applyEnv,
   missingAdapter,
@@ -52,6 +70,7 @@ import {
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
+import { chainForProvider, isChainProviderId, planChainProviders, planChanges, providersInConfig } from "./chain-providers";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { ApiUsageStore, currentMonth, type ApiUsageFile } from "./api-usage";
 import {
@@ -111,6 +130,7 @@ import {
   type OpenCodeFork,
   type LiveSession,
   type NextAgentPick,
+  type AgentChain,
   type StoredAccount,
   type StoredState,
   type TimelineMark,
@@ -160,6 +180,8 @@ const ALIGN_RETRY_MS = 30 * 60_000;
  * failover and waiting switches own it, and a reload would cancel a turn that is about to start.
  */
 const TURN_SETTLE_MS = 60_000;
+/** How often the chains' provider entries are checked against the daemon config (see `syncChainProviders`). */
+const CHAIN_PROVIDERS_MS = 5 * 60_000;
 /**
  * How long an RPC that moves agents or spends a reset waits for that before answering, since Paseo
  * gives up on an RPC after 30 s. The work carries on, and timeline notes and the state say how it went.
@@ -254,8 +276,16 @@ type ForkOutcome =
       toProvider: string | null;
       delivery: ForkDelivery;
       detail?: string;
+      /** A fork to the other provider (Claude ↔ ChatGPT): the account it runs on. */
+      account?: StoredAccount;
+      /** A fork to the other provider: false for a new agent, which is linked to its source (see `linkContinuation`). */
+      reused?: boolean;
     }
-  | { skipped: string };
+  /**
+   * `mode`: the other provider has no mode careful enough (a chain skips its other steps of that
+   * provider). `autoMode`: the account was Bedrock, which can't run the fork's Claude Auto mode.
+   */
+  | { skipped: string; mode?: boolean; autoMode?: boolean };
 
 const UP_TO_DATE_DETAIL = "No update was sent: the OpenCode continuation already has everything from this agent.";
 /** Canonical pages one receipt search may read before it stops, uncertain. */
@@ -518,6 +548,8 @@ export class Service {
   private readonly cleanupFailures = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
+  /** The chains' provider entries: when they were last checked, the runs in order, and why the last one failed. */
+  private chainProviders: { at: number; queue: Promise<void>; error: string | null } = { at: 0, queue: Promise.resolve(), error: null };
   /** Startup's steps have all worked; until they have, each upkeep tries them again. See `startUp`. */
   private started = false;
   private starting: Promise<void> | null = null;
@@ -551,7 +583,11 @@ export class Service {
 
   /** Remember the plugin's SDK connection for background work (cleanup, failover). */
   attach(paseo: PaseoApi): void {
-    this.paseo ??= paseo;
+    if (this.paseo) return;
+    this.paseo = paseo;
+    // The first connection is the earliest moment the chains can be offered in Paseo's picker; the
+    // upkeep would otherwise wait for its next run.
+    if (this.started && !this.stopped) void this.syncChainProviders(paseo);
   }
 
   async start(): Promise<void> {
@@ -570,6 +606,7 @@ export class Service {
       // The last readings show right away; fresh ones replace them as they arrive.
       for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
       await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
+      await this.seedChains();
       this.started = true;
       await this.reportStrayHomes().catch(() => undefined);
     })().finally(() => {
@@ -627,6 +664,8 @@ export class Service {
     // Moves a stop cut short are finished first: the checks below read an account's folder, and the
     // sync further down would make the old one again.
     if (this.hasRecordedMoves(await this.store.read())) await this.finishRecordedMoves();
+    await this.seedChains().catch((error: unknown) => log("could not seed the default chain", error));
+    if (this.paseo && now - this.chainProviders.at >= CHAIN_PROVIDERS_MS) void this.syncChainProviders(this.paseo);
     const state = await this.store.read();
     for (const account of state.accounts) {
       // One still on record (both folders there, say) waits: its folder isn't settled.
@@ -733,6 +772,7 @@ export class Service {
       [
         ...Object.entries(state.sessions).map(([id, session]) => [id, session.openedAt] as const),
         ...Object.entries(state.bindings).map(([id, binding]) => [id, binding.at] as const),
+        ...Object.entries(state.agentChains).map(([id, record]) => [id, record.at] as const),
       ]
         .filter(([id, at]) => !known.has(id) && old(at))
         .map(([id]) => id),
@@ -757,8 +797,12 @@ export class Service {
     const staleChains = Object.entries(state.continuations).filter(([, chain]) =>
       !unsettled(chain.pending) && Object.keys(chain.members).every((id) => !active.has(id) && !this.switching.has(id)),
     );
-    if (staleSessions.length === 0 && staleBindings.length === 0 && staleChains.length === 0) return;
+    const staleAgentChains = Object.entries(state.agentChains).filter(([id, record]) => gone.has(id) && old(record.at)).map(([id]) => id);
+    const staleLinks = Object.keys(state.links).filter((id) => gone.has(id));
+    if (staleSessions.length === 0 && staleBindings.length === 0 && staleChains.length === 0 && staleAgentChains.length === 0 && staleLinks.length === 0) return;
     await this.store.update((draft) => {
+      for (const id of staleAgentChains) delete draft.agentChains[id];
+      for (const id of staleLinks) delete draft.links[id];
       for (const [id] of staleSessions) delete draft.sessions[id];
       for (const [id] of staleBindings) delete draft.bindings[id];
       for (const [id] of staleChains) delete draft.continuations[id];
@@ -1016,7 +1060,12 @@ export class Service {
     abandoned?: AbortSignal,
   ): Promise<PluginSessionOpenRequest | undefined> {
     this.attach(context.paseo);
-    const family = (await this.families.resolve(context.paseo))[request.provider];
+    let family = (await this.families.resolve(context.paseo))[request.provider];
+    if (!family && isChainProviderId(request.provider)) {
+      // A chain's provider entry written since the map was cached.
+      this.families.invalidate();
+      family = (await this.families.resolve(context.paseo))[request.provider];
+    }
     if (!family) return undefined;
     // A family known not to work here (Cursor off Linux, with a registry made on Linux, say) gives an
     // added account no env of its own: the session runs on the CLI login, so it isn't routed or
@@ -1035,7 +1084,35 @@ export class Service {
     const reload = interactive ? this.reloads.get(request.agentId) : undefined;
     if (reload) reload.opens += 1;
     const ownReload = reload?.opens === 1;
-    const state = await this.store.read();
+    let state = await this.store.read();
+    // A new agent created on a chain's provider (picked in Paseo's provider picker or an Agent
+    // profile, see server/chain-providers.ts) follows that chain from its first step, instead of the
+    // default one. One whose chain was deleted follows none.
+    const picked = request.reason === "create" && interactive && isChainFamily(family) ? chainForProvider(state, request.provider) : undefined;
+    if (picked && !state.agentChains[request.agentId]) {
+      const { chainId } = picked;
+      state = await this.store.update((draft) => {
+        draft.agentChains[request.agentId] ??= { chainId, step: 0, manual: false, at: new Date(now).toISOString() };
+      });
+      console.log(`[ZeroSub] ${request.agentId} follows ${chainId ? `chain ${chainId}` : "no chain (its chain was deleted)"}: created on ${request.provider}`);
+    }
+    // A new agent of the user's own follows the default fallback chain from its first step. An
+    // agent ZeroSub creates to carry work on already has its chain (see `inheritChain`).
+    if (request.reason === "create" && isChainFamily(family) && takesNextPick(request) && state.defaultChain && !state.agentChains[request.agentId]) {
+      const chainId = state.defaultChain;
+      state = await this.store.update((draft) => {
+        if (!draft.agentChains[request.agentId] && draft.chains.some((chain) => chain.id === chainId)) {
+          draft.agentChains[request.agentId] = { chainId, step: 0, manual: false, at: new Date(now).toISOString() };
+        }
+      });
+    }
+    // A chain would put a Claude agent whose mode isn't known yet on a Bedrock step: ask for its mode
+    // first, as paid fallback does (see `autoModeBlocks`), so one in Auto mode passes over that step.
+    const onChain = family === "claude" && !this.agentModes.has(request.agentId) ? chainOf(state, request.agentId) : null;
+    if (onChain) {
+      const plain = placement(state, onChain.chain, onChain.record, family, now);
+      if (plain !== null && this.onBedrockStep(state, onChain.chain.steps[plain]!)) await this.modeOf(context.paseo, request.agentId);
+    }
     const input: RouteInput = {
       agentId: request.agentId,
       family,
@@ -1050,6 +1127,7 @@ export class Service {
       // Alignment and the account button decide with the same stand-in rule, so a reopen lands where they expect.
       current: request.reason === "create" ? undefined : this.standingIn(state, request.agentId, family, request.reason === "refresh"),
       allowNextPick: takesNextPick(request),
+      step: this.stepInput(state, request.agentId, family),
     };
     let first = chooseAccount(state, input);
     // Paid fallback would put a Claude agent on Bedrock by itself: not one in Auto mode, which Bedrock
@@ -1543,10 +1621,19 @@ export class Service {
       return;
     }
     // Another subscription account comes first, then a banked reset (free), and a paid Azure or
-    // Bedrock account (with `paidApiFallback` on) only once neither is to be had.
+    // Bedrock account (with `paidApiFallback` on) only once neither is to be had. An agent on a
+    // fallback chain rotates within its step (the subscription pool) the same way, then walks its
+    // chain (see `advanceChain`), which takes the place of the paid fallback, the fork toggle and the
+    // last-resort rule.
+    const chainContext = this.chainFor(latest, agentId, family);
+    const chainStep = chainContext ? this.stepInput(latest, agentId, family) : undefined;
     let move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id, false) : null;
     let autoModeSkip: string | null = null;
-    let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    let next = adapter.portable
+      ? move?.account
+      : chainStep?.kind === "account"
+        ? undefined
+        : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
         // Opt-in: every subscription account is out, so spend a banked reset rather than stop (or pay).
@@ -1575,6 +1662,10 @@ export class Service {
           return;
         }
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
+      }
+      if (chainContext) {
+        await this.advanceChain(paseo, agentId, family, account, chainContext, timeline, reason, base, endedAt, now);
+        return;
       }
       if (adapter.portable && this.prefs.paidApiFallback) {
         move = this.nextAccount(await this.store.read(), agentId, family, account.id, true);
@@ -1606,6 +1697,7 @@ export class Service {
         }));
         if ("fork" in result) {
           this.switchGuard.note(agentId, now);
+          if (result.reused === false) await this.linkContinuation(paseo, agentId, result.fork);
           await this.appendRow(paseo, agentId, {
             ...base,
             to: result.to,
@@ -1674,6 +1766,8 @@ export class Service {
     try {
       const continuation = await this.continueElsewhere(paseo, agentId, next, why, timeline, "auto");
       this.switchGuard.note(agentId, now);
+      if (chainContext) await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, chainContext.index));
+      await this.linkContinuation(paseo, agentId, continuation);
       await this.appendRow(paseo, agentId, {
         ...base,
         to: next.label,
@@ -1974,10 +2068,365 @@ export class Service {
     exhausted: string,
     paid = this.paidFor(family, agentId),
   ): { account: StoredAccount; pin: boolean } | undefined {
-    const routed = this.routeFor(state, agentId, family, exhausted, paid);
+    const step = this.stepInput(state, agentId, family);
+    // A chain's API-account step has no other account to rotate to: the chain moves on (see `advanceChain`).
+    if (step?.kind === "account") return undefined;
+    // On a chain, paid accounts are steps of their own, never stand-ins.
+    const allowPaid = step ? false : paid;
+    const routed = this.routeFor(state, agentId, family, exhausted, allowPaid);
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
-    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), paid);
+    const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), allowPaid);
     return roomiest && { account: roomiest, pin: true };
+  }
+
+  // ------------------------------------------------------------------ fallback chains (this fork)
+
+  /** Seeds the default chain on first run, and keeps a seeded, unedited chain in step with the accounts. */
+  private async seedChains(): Promise<void> {
+    if (!seedChains(structuredClone(await this.store.read()))) return;
+    // A seeded chain's steps (and so its provider entry's description) may change too.
+    this.chainProviders.at = 0;
+    await this.store.update((draft) => {
+      seedChains(draft);
+    });
+  }
+
+  /**
+   * Offers each chain as a provider in Paseo's provider picker and Agent profiles: adds, updates and
+   * removes ZeroSub's `zerosub-chain-…` entries in the daemon config, and nothing else (see
+   * server/chain-providers.ts). An entry no chain offers any more stays while an agent (archived ones
+   * too), an Agent profile or metadata generation uses it, since Paseo can't reopen an agent whose
+   * provider is gone. Runs one at a time; never throws: a failure (a daemon that won't let plugins
+   * write its config, say) is logged and shown on the Accounts screen, and agents can still follow a
+   * chain by `/chain` and the account button.
+   */
+  syncChainProviders(paseo: PaseoApi): Promise<void> {
+    const run = this.chainProviders.queue.then(() => this.syncChainProvidersNow(paseo));
+    this.chainProviders.queue = run;
+    return run;
+  }
+
+  private async syncChainProvidersNow(paseo: PaseoApi): Promise<void> {
+    this.chainProviders.at = Date.now();
+    try {
+      const { config } = await paseo.config.get();
+      const raw = config as Record<string, unknown>;
+      const providers = raw.providers && typeof raw.providers === "object" ? (raw.providers as Record<string, unknown>) : {};
+      const state = await this.store.read();
+      let plan = planChainProviders(state, providers, null);
+      if (plan.kept.length > 0) {
+        // Only an entry that may be unused needs the agents listed; an incomplete list keeps them all.
+        const { agents, complete } = await listAgents(paseo, true);
+        if (complete) plan = planChainProviders(state, providers, new Set([...agents.map((agent) => agent.provider), ...providersInConfig(raw)]));
+      }
+      if (planChanges(plan)) {
+        await paseo.config.patch({ providers: plan.set, ...(plan.remove.length > 0 ? { removeProviders: plan.remove } : {}) });
+        this.families.invalidate();
+        const changed = Object.keys(plan.set);
+        console.log(
+          `[ZeroSub] chain providers: ${[changed.length > 0 ? `wrote ${changed.join(", ")}` : "", plan.remove.length > 0 ? `removed ${plan.remove.join(", ")}` : ""].filter(Boolean).join("; ")}`,
+        );
+      }
+      this.chainProviders.error = null;
+    } catch (error) {
+      const why = describe(error);
+      if (this.chainProviders.error !== why) log("could not offer the fallback chains as providers in Paseo's picker and Agent profiles", error);
+      this.chainProviders.error = why;
+    }
+  }
+
+  /** The chain an agent of `family` follows and the step it runs at now; null for none. */
+  private chainFor(state: StoredState, agentId: string, family: Family): { chain: Chain; record: AgentChain; index: number } | null {
+    if (!isChainFamily(family)) return null;
+    const found = chainOf(state, agentId);
+    if (!found) return null;
+    const index = placement(state, found.chain, found.record, family, Date.now(), this.autoModeBlocks(agentId, family) ? (step) => this.onBedrockStep(state, step) : undefined);
+    return index === null ? null : { ...found, index };
+  }
+
+  /**
+   * Whether this agent can't run on Bedrock: a Claude agent in Auto mode, or whose mode isn't known
+   * (Auto is Paseo's default), as `paidFor` reads it. Its chain passes over Bedrock steps then.
+   */
+  private autoModeBlocks(agentId: string, family: Family): boolean {
+    return family === "claude" && runsAutoMode(this.agentModes.get(agentId));
+  }
+
+  /** A chain step that's an AWS Bedrock account. */
+  private onBedrockStep(state: StoredState, step: ChainStep): boolean {
+    const account = step.source === "account" ? findAccount(state, step.accountId) : undefined;
+    return Boolean(account && isBedrockAccount(account));
+  }
+
+  /** What routing is told about the agent's chain step (see `RouteInput.step`). */
+  private stepInput(state: StoredState, agentId: string, family: Family): RouteInput["step"] {
+    const context = this.chainFor(state, agentId, family);
+    const step = context?.chain.steps[context.index];
+    if (!step) return undefined;
+    return step.source === "account" && step.accountId ? { kind: "account", accountId: step.accountId } : { kind: "pool" };
+  }
+
+  /** The chain's details for a timeline note about moving to step `index`. */
+  private chainNote(state: StoredState, chain: Chain, index: number, from: string | null, model: string | null = null): NonNullable<SwitchRow["chain"]> {
+    const step = chain.steps[index]!;
+    return { name: chain.name, step: index + 1, steps: chain.steps.length, label: stepLabel(state, step), model: model ?? step.model ?? null, from };
+  }
+
+  /** Moves an agent's chain record to `step` (as the furthest step reached), unless it changed meanwhile. */
+  private async setChainStep(agentId: string, chainId: string, step: number, manual = false): Promise<void> {
+    await this.store.update((draft) => {
+      const record = draft.agentChains[agentId];
+      if (record?.chainId === chainId) draft.agentChains[agentId] = { ...record, step, manual, at: new Date().toISOString() };
+    });
+  }
+
+  /** Gives an agent ZeroSub created to carry `from`'s work on the same chain, at `step`. */
+  private inheritChain(draft: StoredState, from: string, to: string, step: number | null, manual = false): void {
+    const record = draft.agentChains[from];
+    if (!record) return;
+    draft.agentChains[to] = { chainId: record.chainId, step: step ?? record.step, manual, at: new Date().toISOString() };
+  }
+
+  /**
+   * Records that `from`'s conversation goes on in `to`, and says so at the top of `to`'s timeline
+   * ("← Continued from …"). The note in `from` is its own switch note, which links forward. Once per
+   * pair: a reused tab or fork isn't told twice.
+   */
+  private async linkContinuation(paseo: PaseoApi, from: string, to: { agentId: string; title: string }): Promise<void> {
+    const state = await this.store.read();
+    if (state.links[to.agentId]?.previous?.agentId === from && state.links[from]?.next?.agentId === to.agentId) return;
+    const [source, target] = await Promise.all([lookUpWorkspace(paseo, from), lookUpWorkspace(paseo, to.agentId)]);
+    await this.store.update((draft) => {
+      draft.links[from] = { previous: draft.links[from]?.previous ?? null, next: { agentId: to.agentId, title: to.title, workspaceId: target.workspaceId } };
+      draft.links[to.agentId] = { next: draft.links[to.agentId]?.next ?? null, previous: { agentId: from, title: source.title ?? "the previous agent", workspaceId: source.workspaceId } };
+    });
+    const row: LinkRow = { direction: "from", agentId: from, title: source.title ?? "the previous agent", workspaceId: source.workspaceId, at: new Date().toISOString() };
+    try {
+      await paseo.agents.ref(to.agentId).timeline.append({ type: "plugin", id: `link-${from}`, kind: LINK_ROW_KIND, version: LINK_ROW_VERSION, data: row });
+    } catch (error) {
+      log(`could not add the back-link to ${to.agentId}`, error);
+    }
+  }
+
+  /**
+   * Walks an agent's chain on from the step whose account `account` just ran out: to the next step
+   * with room. One of its own family moves it in place (Claude) or to its continuation tab (ChatGPT);
+   * one of the other family forks the chat there, starting work at once, with the step's model and
+   * thinking and a mode no more permissive than its own. An agent no mode of the other provider is
+   * careful enough for (Claude's Plan Mode, Always Ask) skips the other family's steps. With no step
+   * left, it stops and says when the earliest frees up.
+   */
+  private async advanceChain(
+    paseo: PaseoApi,
+    agentId: string,
+    family: Family,
+    account: StoredAccount,
+    context: { chain: Chain; record: AgentChain; index: number },
+    timeline: readonly AgentTimelineItem[] | undefined,
+    reason: "limit" | "signed_out",
+    base: Omit<SwitchRow, "to" | "reason" | "outcome">,
+    endedAt: number,
+    now: number,
+  ): Promise<void> {
+    const { chain } = context;
+    const state = await this.store.read();
+    const current = stepOf(state, chain, account, context.index) ?? context.index;
+    const from = leavingText(state, chain.steps[current], account, reason);
+    const skipped: string[] = [];
+    // Bedrock steps an agent in Claude's Auto mode skipped: said where it lands, too.
+    const autoSkips: string[] = [];
+    let crossBlocked = false;
+    for (let index = current + 1; index < chain.steps.length; index += 1) {
+      const step = chain.steps[index]!;
+      if (isBroken(state, step)) {
+        skipped.push(`Step ${index + 1} names an account that was removed, so it was skipped.`);
+        continue;
+      }
+      if (!stepAvailable(state, step, now)) continue;
+      const target = stepFamily(state, step)!;
+      const note = (model: string | null = null) => this.chainNote(state, chain, index, from, model);
+      if (target === family) {
+        // Bedrock can't run Claude's Auto mode (see `paidFor`): an agent in it skips a Bedrock step.
+        const stepOn = step.source === "account" ? stepAccount(state, step) : undefined;
+        if (family === "claude" && stepOn && isBedrockAccount(stepOn) && runsAutoMode(await this.modeOf(paseo, agentId))) {
+          console.log(`[ZeroSub] ${agentId} skips step ${index + 1} of chain ${chain.id}: it's in Claude's Auto mode, which Bedrock can't run`);
+          skipped.push(autoModeSkipNote(stepOn.label));
+          autoSkips.push(autoModeSkipNote(stepOn.label));
+          continue;
+        }
+        if (this.adapters[family].portable) {
+          await this.setChainStep(agentId, chain.id, index);
+          this.switchGuard.note(agentId, now);
+          const result = await this.reopenAgent(paseo, agentId, { settle: true });
+          const continued = result.outcome === "reopened" && this.prefs.autoContinue && (await this.untouchedSince(paseo, agentId, endedAt));
+          const landed = findAccount(await this.store.read(), (await this.store.read()).sessions[agentId]?.accountId);
+          await this.appendRow(paseo, agentId, {
+            ...base,
+            to: landed?.label ?? stepLabel(state, step),
+            reason,
+            continued,
+            outcome: result.outcome === "reopened" ? "switched" : "pending",
+            detail: result.outcome === "failed" ? failureDetail(result) : joinDetails(...autoSkips),
+            chain: note(),
+          });
+          if (continued) await this.carryOn(paseo, agentId, endedAt);
+          return;
+        }
+        // A ChatGPT thread can't change accounts: the task goes on in its tab for the step's account.
+        const next = step.source === "account" ? stepAccount(state, step) : mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([account.id]), false);
+        if (!next || !HAND_OFF[family] || !this.prefs.autoContinue) continue;
+        try {
+          const continuation = await this.continueElsewhere(paseo, agentId, next, `its fallback chain “${chain.name}” moved on: ${from.toLowerCase()}`, timeline, "auto");
+          this.switchGuard.note(agentId, now);
+          await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, index));
+          await this.linkContinuation(paseo, agentId, continuation);
+          await this.appendRow(paseo, agentId, { ...base, to: next.label, reason, continued: true, continuedIn: continuation, outcome: "continued", detail: joinDetails(...autoSkips), chain: note() });
+          return;
+        } catch (error) {
+          skipped.push(`Couldn't continue on ${next.label}: ${describe(error)}`);
+          continue;
+        }
+      }
+      if (crossBlocked) continue;
+      const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto", { chain, index }).catch((error: unknown) => ({
+        skipped: `Couldn't continue on ${FAMILY_LABEL[target]}: ${describe(error)}`,
+        mode: false,
+      }));
+      if ("fork" in result) {
+        this.switchGuard.note(agentId, now);
+        if (result.reused === false) await this.linkContinuation(paseo, agentId, result.fork);
+        await this.appendRow(paseo, agentId, {
+          ...base,
+          to: result.to,
+          toFamily: result.toFamily,
+          reason: "exhausted",
+          continued: true,
+          continuedIn: result.fork,
+          outcome: "continued",
+          detail: joinDetails(...autoSkips),
+          chain: note(result.fork.model ?? null),
+        });
+        return;
+      }
+      if ("mode" in result && result.mode) crossBlocked = true;
+      if ("autoMode" in result && result.autoMode) autoSkips.push(result.skipped);
+      skipped.push(result.skipped);
+    }
+    const free = earliestFree(state, chain, now);
+    await this.appendRow(paseo, agentId, {
+      ...base,
+      resetsAt: free ?? base.resetsAt,
+      to: account.label,
+      reason: "exhausted",
+      outcome: "stayed",
+      detail: [`Every later step of chain “${chain.name}” is out too${crossBlocked ? " or can't take this agent" : ""}.`, ...skipped].join(" "),
+      chain: { ...this.chainNote(state, chain, current, from), step: current + 1 },
+    });
+  }
+
+  /** The note's chain details for an agent going back to an earlier step of its chain; null without one. */
+  private returnNote(state: StoredState, agentId: string, target: string): SwitchRow["chain"] {
+    const to = findAccount(state, target);
+    const context = to ? this.chainFor(state, agentId, to.family) : null;
+    return context ? this.chainNote(state, context.chain, context.index, null) : null;
+  }
+
+  /** The chains as the app shows them, for `view`. */
+  private agentChainView(state: StoredState, agentId: string, family: Family, accountId: string): AgentChainView | null {
+    const context = this.chainFor(state, agentId, family);
+    if (!context) return null;
+    // A ChatGPT thread stays on the account holding it, whatever step the chain would have it at.
+    const routed = findAccount(state, accountId);
+    const index = (routed && stepOf(state, context.chain, routed, context.index)) ?? context.index;
+    const step = context.chain.steps[index]!;
+    return {
+      chainId: context.chain.id,
+      name: context.chain.name,
+      step: index,
+      steps: context.chain.steps.length,
+      label: stepLabel(state, step),
+      manual: context.record.manual && index === context.record.step,
+    };
+  }
+
+  async saveChain(input: { id?: string; name: string; steps: ChainStep[]; picker?: boolean }, paseo?: PaseoApi): Promise<{ id: string }> {
+    const id = input.id ?? newChainId();
+    let problem: string | null = null;
+    await this.store.update((draft) => {
+      const existing = draft.chains.find((chain) => chain.id === id);
+      if (input.id && !existing) {
+        problem = "That chain no longer exists.";
+        return;
+      }
+      const picker = input.picker ?? existing?.picker;
+      const chain: Chain = {
+        id,
+        name: input.name.trim(),
+        steps: input.steps.map((step) => ({ ...step, accountId: step.source === "account" ? step.accountId : null, model: step.model?.trim() || null, thinking: step.thinking?.trim() || null })),
+        auto: false,
+        ...(picker === false ? { picker: false } : {}),
+      };
+      problem = chainProblem(draft, chain);
+      if (problem) return;
+      if (existing) {
+        Object.assign(existing, chain);
+        if (chain.picker === undefined) delete existing.picker;
+      } else draft.chains.push(chain);
+      draft.chainsSeeded = true;
+      // Steps may have moved: agents start again from the first step of their family that has room.
+      for (const record of Object.values(draft.agentChains)) if (record.chainId === id) Object.assign(record, { step: 0, manual: false });
+    });
+    if (problem) throw new Error(problem);
+    console.log(`[ZeroSub] saved chain ${input.name}`);
+    const connection = paseo ?? this.paseo;
+    if (connection) await this.syncChainProviders(connection);
+    return { id };
+  }
+
+  async deleteChain(id: string, paseo?: PaseoApi): Promise<void> {
+    await this.store.update((draft) => {
+      draft.chains = draft.chains.filter((chain) => chain.id !== id);
+      if (draft.defaultChain === id) draft.defaultChain = null;
+      draft.chainsSeeded = true;
+      // Agents that followed it have no chain now: they behave as without chains.
+      for (const record of Object.values(draft.agentChains)) if (record.chainId === id) Object.assign(record, { chainId: null, step: 0, manual: false });
+    });
+    // Its provider entry goes, or stays marked deleted while agents or profiles use it.
+    const connection = paseo ?? this.paseo;
+    if (connection) await this.syncChainProviders(connection);
+  }
+
+  async setDefaultChain(id: string | null): Promise<void> {
+    const state = await this.store.read();
+    if (id && !state.chains.some((chain) => chain.id === id)) throw new Error("That chain no longer exists.");
+    await this.store.update((draft) => {
+      draft.defaultChain = id;
+      draft.chainsSeeded = true;
+    });
+  }
+
+  /** `/chain <name>`, `/chain default`, `/chain off`, and the account button's chain menu. */
+  async setAgentChain(paseo: PaseoApi, agentId: string, mode: "chain" | "default" | "off", chainId?: string): Promise<{ chain: string | null }> {
+    this.attach(paseo);
+    const info = await lookUpAgent(paseo, agentId);
+    if (!info) throw new Error("That agent is no longer available.");
+    const family = (await this.families.resolve(paseo))[info.provider];
+    if (!family || !isChainFamily(family)) throw new Error("Fallback chains are for Claude and ChatGPT (Codex) agents.");
+    const state = await this.store.read();
+    const id = mode === "off" ? null : mode === "default" ? state.defaultChain : (chainId ?? null);
+    if (mode === "default" && !id) throw new Error("There's no default chain. Make one the default in Accounts → Chains.");
+    const chain = id ? state.chains.find((entry) => entry.id === id) : undefined;
+    if (id && !chain) throw new Error("That chain no longer exists.");
+    if (chain && !chain.steps.some((step) => stepFamily(state, step) === family)) {
+      throw new Error(`Chain “${chain.name}” has no ${FAMILY_LABEL[family]} step for this agent to run on.`);
+    }
+    await this.store.update((draft) => {
+      draft.agentChains[agentId] = { chainId: id, step: 0, manual: false, at: new Date().toISOString() };
+    });
+    console.log(`[ZeroSub] ${agentId} follows ${chain ? `chain ${chain.name}` : "no chain"}`);
+    // Its step's account may differ from where it runs: alignment moves it if it can't work there.
+    void this.alignSessions(paseo).catch(() => undefined);
+    return { chain: chain?.name ?? null };
   }
 
   /** Pins an agent to the account an automatic switch moved it to, unless the user picked one since `seen`. */
@@ -2060,9 +2509,12 @@ export class Service {
     family: Family,
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
+    /** A fallback chain's step to fork to: its account (or its pool's roomiest subscription), model and thinking. */
+    chainTarget?: { chain: Chain; index: number },
   ): Promise<ForkOutcome> {
     const other = OTHER_FAMILY[family];
     if (!other) return { skipped: `${FAMILY_LABEL[family]} agents don't carry on with another provider.` };
+    const step = chainTarget?.chain.steps[chainTarget.index];
     const name = FAMILY_LABEL[other];
     const families = await this.families.resolve(paseo);
     const state = await this.store.read();
@@ -2079,6 +2531,8 @@ export class Service {
         toFamily: other,
         toProvider: null,
         delivery: "sent",
+        account: earlierAccount,
+        reused: true,
         ...(isLastResort(earlierAccount) ? { detail: paidFallbackNote(earlierAccount) } : {}),
       };
     }
@@ -2095,20 +2549,26 @@ export class Service {
     }
 
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
-    const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other);
+    // The built-in provider, or a profile of the user's that runs it; never a chain's provider entry,
+    // whose own chain would be bound to the fork (the fork follows this agent's chain, set below).
+    const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other && !isChainProviderId(id));
     const available = provider
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
     if (!provider || !available) return { skipped: `${name} isn't available in Paseo on this host.` };
     const now = Date.now();
-    let account = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), this.prefs.paidApiFallback);
+    let account =
+      step?.source === "account"
+        ? stepAccount(state, step)
+        : mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), step ? false : this.prefs.paidApiFallback);
     // A fork is a new agent that can't change accounts later, so a free banked reset goes before a paid stand-in here too.
-    if (account && isLastResort(account) && this.prefs.autoRedeem) {
+    // (A chain's step never takes a paid stand-in by itself: its account is the step's.)
+    if (!step && account && isLastResort(account) && this.prefs.autoRedeem) {
       account = withBankedReset(state, other, (id) => this.usage.get(id), now) ?? account;
     }
-    if (!account) {
+    if (!account || (step?.source === "account" && !isUsable(account, now))) {
       // API accounts are billed per use, so they never take work over by themselves; say so rather than "at its limit".
-      const apiOnly = accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
+      const apiOnly = !step && accountsOf(state, other).some((entry) => entry.auth === "api" && isUsable(entry, now));
       return {
         skipped: apiOnly
           ? `The only ${name} accounts with room use an API key, which ZeroSub never moves work onto by itself. To use one, start a ${name} agent and pick it from the agent's account button.`
@@ -2127,12 +2587,14 @@ export class Service {
       const current = sourceModes.find((mode) => mode.id === original.currentModeId)?.label;
       return {
         skipped: `${name} has no mode as careful as this agent's${current ? ` (“${current}”)` : ""}, so ZeroSub didn't continue it there.`,
+        mode: true,
       };
     }
     // A fork in Claude's Auto mode can't run on Bedrock (see `paidFor`): a subscription account, or none.
+    // A chain's Bedrock step is that account or nothing: the chain moves on to its next step.
     if (other === "claude" && isBedrockAccount(account) && runsAutoMode(modeId)) {
-      const subscription = mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), false);
-      if (!subscription) return { skipped: autoModeSkipNote(account.label) };
+      const subscription = step ? undefined : mostAvailable(state, other, (id) => this.usage.get(id), now, new Set(), false);
+      if (!subscription) return { skipped: autoModeSkipNote(account.label), autoMode: true };
       account = subscription;
     }
 
@@ -2148,7 +2610,7 @@ export class Service {
       timeline,
       why: source === "auto" ? `every ${FAMILY_LABEL[family]} account reached its usage limit` : `the work was moved to ${name}`,
       previous: PROVIDER_NAME[family],
-      target: { provider, label: name, modeId },
+      target: { provider, label: name, modeId, model: step?.model ?? null, thinkingOptionId: step?.thinking ?? null },
       parentId: await this.continuations.parentFor(paseo, agentId),
       bind: async (newAgentId) => {
         await this.store.update((draft) => {
@@ -2157,16 +2619,21 @@ export class Service {
             source: source === "user" ? "user" : this.adapters[other].portable ? "auto" : "thread",
             at: new Date().toISOString(),
           };
+          // The fork follows the same chain, from the step it starts on; without one it has none.
+          if (chainTarget) this.inheritChain(draft, agentId, newAgentId, chainTarget.index);
+          else draft.agentChains[newAgentId] = { chainId: null, step: 0, manual: false, at: new Date().toISOString() };
         });
       },
     });
     console.log(`[ZeroSub] ${agentId} continues on ${name} (${account.label}) in ${fork.agentId}`);
     return {
-      fork,
+      fork: { ...fork, workspaceId: original.workspaceId ?? null },
       to: account.label,
       toFamily: other,
       toProvider: null,
       delivery: "sent",
+      account,
+      reused: false,
       ...(isLastResort(account) ? { detail: paidFallbackNote(account) } : {}),
     };
   }
@@ -2779,10 +3246,16 @@ export class Service {
       if (family !== "claude") throw new Error("Only Claude agents can continue on OpenCode.");
       result = await this.forkToOpenCode(paseo, agentId, "user");
     } else {
-      result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user");
+      // On a chain, the fork goes to the first step of the other provider that has room.
+      const before = await this.store.read();
+      const context = this.chainFor(before, agentId, family);
+      const other = OTHER_FAMILY[family];
+      const index = context ? context.chain.steps.findIndex((step) => stepFamily(before, step) === other && stepAvailable(before, step, Date.now())) : -1;
+      result = await this.forkToOtherProvider(paseo, agentId, family, undefined, "user", context && index >= 0 ? { chain: context.chain, index } : undefined);
     }
     if ("skipped" in result) throw new Error(result.skipped);
     const state = await this.store.read();
+    if (result.reused === false) await this.linkContinuation(paseo, agentId, result.fork);
     await this.appendRow(paseo, agentId, {
       family,
       from: findAccount(state, this.runningOn(state, agentId, family))?.label ?? null,
@@ -2904,6 +3377,10 @@ export class Service {
       const why = `its ChatGPT account (${from.label}) reached its usage limit, and ${to.label} could not resume the thread`;
       try {
         const continuation = await this.continueElsewhere(paseo, agentId, to, why, timeline, "auto");
+        // The new tab follows this agent's fallback chain, and the two link to each other.
+        const chainContext = this.chainFor(state, agentId, family);
+        if (chainContext) await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, chainContext.index));
+        await this.linkContinuation(paseo, agentId, continuation);
         await this.appendRow(paseo, agentId, {
           family,
           from: from.label,
@@ -3018,6 +3495,7 @@ export class Service {
       portable: this.adapters[family].portable,
       usageOf: (id) => this.usage.get(id),
       current,
+      step: this.stepInput(state, agentId, family),
     });
   }
 
@@ -3207,6 +3685,7 @@ export class Service {
           toProvider: null,
           outcome: "switched",
           detail: null,
+          chain: why === "room" ? this.returnNote(state, agentId, target) : null,
           at: new Date().toISOString(),
         };
         const result = await this.reopenAgent(paseo, agentId, { row, background: options.background });
@@ -3350,6 +3829,18 @@ export class Service {
     return stranded || (reason !== "manual" && reason !== "default");
   }
 
+  /**
+   * The agent's fallback chain has it back at an earlier step than the one its session runs on (a
+   * Bedrock account it fell back to, say, once another has room again): alignment moves it there.
+   */
+  private backOnChain(state: StoredState, agentId: string, from: StoredAccount, target: string): boolean {
+    const to = findAccount(state, target);
+    const context = to ? this.chainFor(state, agentId, to.family) : null;
+    if (!context || !to) return false;
+    const running = stepOf(state, context.chain, from);
+    return running !== null && context.index < running && stepOf(state, context.chain, to, context.index) === context.index;
+  }
+
   /** Why an agent's session no longer runs on the account it's routed to, for its timeline note. */
   private driftReason(state: StoredState, agentId: string, current: string, target: string, now: number): SwitchRow["reason"] {
     const from = findAccount(state, current);
@@ -3358,6 +3849,7 @@ export class Service {
     if (from.disabled) return "disabled";
     if (isLimited(from, now)) return "limit";
     if (this.leavesPaid(state, current, target)) return "room";
+    if (this.backOnChain(state, agentId, from, target)) return "room";
     return state.bindings[agentId]?.accountId === target ? "manual" : "default";
   }
 
@@ -3526,6 +4018,9 @@ export class Service {
         pendingAccountId: pending,
         waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
+        chain: this.agentChainView(state, agent.id, family, accountId),
+        chainOff: state.agentChains[agent.id]?.chainId === null,
+        ...(state.links[agent.id] ? { links: state.links[agent.id] } : {}),
       });
     }
 
@@ -3628,6 +4123,8 @@ export class Service {
       piLaunchers: piScripts.length > 0 ? piLauncherDir() : null,
       claudeHomes: this.adapters.claude.homesInUse ? { dir: shownPath(homesNow("claude")), isDefault: state.claudeHomes.dir === null } : null,
       piHomes: this.adapters.pi.homesInUse ? { dir: shownPath(homesNow("pi")), isDefault: state.piHomes.dir === null } : null,
+      chains: chainViews(state, now),
+      chainProvidersError: this.chainProviders.error,
     };
   }
 
@@ -3930,6 +4427,18 @@ export class Service {
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
     if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
     if (accountId && this.prefs.autoSwitch && isLimited(target, Date.now())) throw new Error(limitedPick(target.label));
+    // On a fallback chain, a pick puts the agent at the matching step, where it stays (no return to an
+    // earlier step) until that step runs out. "Follow default" starts it from its first step again.
+    const context = this.chainFor(state, agentId, family);
+    const pickedStep = context && accountId ? stepOf(state, context.chain, target, context.index) : null;
+    if (context && accountId && pickedStep === null) {
+      throw new Error(
+        `${target.label} isn't a step of chain “${context.chain.name}”. Add it to the chain in Accounts → Chains, or turn the chain off for this agent with /chain off.`,
+      );
+    }
+    const placeOnChain = async (on: string) => {
+      if (context) await this.setChainStep(on, context.chain.id, pickedStep ?? 0, pickedStep !== null);
+    };
 
     if (!adapter.portable) {
       if (info.status === "running" || info.status === "initializing") {
@@ -3950,6 +4459,8 @@ export class Service {
             undefined,
             "user",
           ));
+          if (context) await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, pickedStep ?? 0, pickedStep !== null));
+          await this.linkContinuation(paseo, agentId, continuation);
           await this.appendRow(paseo, agentId, {
             family,
             from,
@@ -3989,6 +4500,7 @@ export class Service {
       }
     }
 
+    await placeOnChain(agentId);
     await this.store.update((draft) => {
       if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
       else delete draft.bindings[agentId];
@@ -5485,6 +5997,16 @@ async function lookUpAgent(paseo: PaseoApi, agentId: string): Promise<AgentInfo 
 }
 
 /** The agent, or null when it's gone or can't be looked up: for callers that then leave it alone. */
+/** An agent's title and workspace, for a link to it; nulls when Paseo can't say. */
+async function lookUpWorkspace(paseo: PaseoApi, agentId: string): Promise<{ title: string | null; workspaceId: string | null }> {
+  try {
+    const agent = (await paseo.agents.ref(agentId).refresh())?.agent as { title?: string | null; workspaceId?: string | null } | undefined;
+    return { title: agent?.title ?? null, workspaceId: agent?.workspaceId ?? null };
+  } catch {
+    return { title: null, workspaceId: null };
+  }
+}
+
 async function agentInfo(paseo: PaseoApi, agentId: string): Promise<AgentInfo | null> {
   return lookUpAgent(paseo, agentId).catch(() => null);
 }

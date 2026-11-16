@@ -2,6 +2,7 @@ import { chmod, copyFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { AccountKindSchema, ApiProviderSchema, AuthKindSchema, FamilySchema, type Family } from "../shared/model";
+import { AgentLinksSchema, ChainSchema } from "../shared/chains";
 import { Mutex, readJson, readText, writeJsonAtomic } from "./json-file";
 import { statePath } from "./paths";
 
@@ -192,6 +193,18 @@ export type Homes = z.infer<typeof HomesSchema>;
 export const MoveSchema = z.object({ from: z.string(), to: z.string(), at: z.string(), family: FamilySchema.optional() });
 export type Move = z.infer<typeof MoveSchema>;
 
+/**
+ * The fallback chain an agent follows (this fork): `chainId` null means "no chain" (the behavior
+ * without chains). `step` is the furthest step it was moved to; `manual` when the user picked it.
+ */
+export const AgentChainSchema = z.object({
+  chainId: z.string().nullable(),
+  step: z.number().int().nonnegative().default(0),
+  manual: z.boolean().default(false),
+  at: z.string(),
+});
+export type AgentChain = z.infer<typeof AgentChainSchema>;
+
 export const StoredStateSchema = z.object({
   version: z.literal(1).default(1),
   accounts: z.array(StoredAccountSchema).default([]),
@@ -233,6 +246,14 @@ export const StoredStateSchema = z.object({
   claudeHomes: HomesSchema.default({ dir: null, from: [] }),
   /** Homes being moved, by account (see `Service.placeHomes`). */
   moves: z.record(z.string(), MoveSchema).default({}),
+  /** Fallback chains (this fork), the default one new agents follow, and whether the first one was seeded yet. */
+  chains: z.array(ChainSchema).default([]),
+  defaultChain: z.string().nullable().default(null),
+  chainsSeeded: z.boolean().default(false),
+  /** Each agent's chain, set when it's created (agents from before chains have none: no chain). */
+  agentChains: z.record(z.string(), AgentChainSchema).default({}),
+  /** Conversations that continue in another agent: the agent they went on in, and the one they came from. */
+  links: z.record(z.string(), AgentLinksSchema).default({}),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -284,6 +305,13 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       piHomes: keep(HomesSchema, source.piHomes ?? {}) ?? { dir: null, from: [] },
       claudeHomes: keep(HomesSchema, source.claudeHomes ?? {}) ?? { dir: null, from: [] },
       moves: records(MoveSchema, source.moves),
+      chains: (Array.isArray(source.chains) ? source.chains : [])
+        .map((entry) => keep(ChainSchema, entry))
+        .filter((entry): entry is z.infer<typeof ChainSchema> => entry !== undefined),
+      defaultChain: typeof source.defaultChain === "string" ? source.defaultChain : null,
+      chainsSeeded: source.chainsSeeded === true,
+      agentChains: records(AgentChainSchema, source.agentChains),
+      links: records(AgentLinksSchema, source.links),
     },
     dropped: true,
   };

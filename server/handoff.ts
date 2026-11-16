@@ -279,6 +279,10 @@ export async function defaultModel(paseo: PaseoApi, provider: string): Promise<s
 export interface Continuation {
   agentId: string;
   title: string;
+  /** The model the new agent started on, when ZeroSub chose it (a fork to the other provider). */
+  model?: string;
+  /** The workspace it's in, for a link to it. */
+  workspaceId?: string | null;
 }
 
 /** Another provider to continue on, instead of the source agent's own. */
@@ -289,10 +293,10 @@ export interface ContinuationTarget {
   label: string;
   /** The fork's mode. ChatGPT gets one no looser than the source's; OpenCode gets Plan or Build. */
   modeId: string;
-  /** A model from the host's catalog for this provider. Empty uses the provider's default. */
-  model?: string;
+  /** A model from the host's catalog for this provider (or a fallback chain step's). Empty uses the provider's default. */
+  model?: string | null;
   /** A thinking option that model offers. Empty uses the model's default. */
-  thinkingOptionId?: string;
+  thinkingOptionId?: string | null;
 }
 
 /**
@@ -353,7 +357,7 @@ export async function continueInNewAgent(options: {
   const { target } = options;
   const provider = target?.provider ?? source.provider;
   const model = target
-    ? (target.model ?? (await defaultModel(paseo, provider)))
+    ? (target.model?.trim() || (await defaultModel(paseo, provider)))
     : (source.model ?? source.runtimeInfo?.model ?? (await defaultModel(paseo, provider)));
   if (!model) throw new Error(`Couldn't tell which ${provider} model to use for the new agent.`);
 
@@ -406,5 +410,5 @@ export async function continueInNewAgent(options: {
     if (failed || (error instanceof Error && error.message === "agent_request_key_conflict")) await options.onCreateRejected?.(failed && outcomeUnknown);
     throw error;
   }
-  return { agentId, title };
+  return { agentId, title, ...(target ? { model } : {}) };
 }
