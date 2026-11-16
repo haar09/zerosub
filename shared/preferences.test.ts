@@ -34,9 +34,11 @@ describe("preferences", () => {
     expect(preferences.schema.parse(shipped.parse({})).claudeForkDestination).toBe("codex");
   });
 
-  it("never falls back to paid API accounts unless that switch is turned on", () => {
-    expect(preferences.schema.parse({}).paidApiFallback).toBe(false);
-    expect(preferences.schema.parse(shipped.parse({ autoSwitch: true })).paidApiFallback).toBe(false);
+  it("falls back to paid API accounts by default in this deployment build, unless that switch is turned off", () => {
+    // Deployment divergence: upstream defaults it to off.
+    expect(preferences.schema.parse({}).paidApiFallback).toBe(true);
+    expect(preferences.schema.parse(shipped.parse({ autoSwitch: true })).paidApiFallback).toBe(true);
+    expect(preferences.schema.parse({ paidApiFallback: false }).paidApiFallback).toBe(false);
   });
 
   it("can still be read by 1.2.2 after a downgrade", () => {

@@ -212,7 +212,8 @@ const DEFAULT_PREFERENCES: Preferences = {
   forkOpenCodeModel: "",
   forkOpenCodeThinking: "",
   codexSameConversation: false,
-  paidApiFallback: false,
+  // Deployment divergence: on by default in this build (see `paidApiFallback` in shared/preferences.ts).
+  paidApiFallback: true,
 };
 
 interface LoginSession {

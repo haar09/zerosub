@@ -134,7 +134,7 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
           />
           <SettingsSwitch
             label="Use paid API accounts when every subscription is out"
-            hint="Off unless you turn it on. When every subscription account of a provider is at its limit, signed out or disabled, agents may move to an Azure OpenAI account (ChatGPT) or an AWS Bedrock account (Claude), billed per token (after a banked reset, if those are used automatically), and Claude agents move back once a subscription has room. Off, those are used only as the default or when you pick one for an agent."
+            hint="On by default in this build. When every subscription account of a provider is at its limit, signed out or disabled, agents may move to an Azure OpenAI account (ChatGPT) or an AWS Bedrock account (Claude), billed per token (after a banked reset, if those are used automatically), and Claude agents move back once a subscription has room. Off, those are used only as the default or when you pick one for an agent. Agents on a fallback chain follow the chain instead."
             value={settings.values.paidApiFallback}
             disabled={settings.saving}
             onValueChange={(paidApiFallback) => save({ paidApiFallback })}

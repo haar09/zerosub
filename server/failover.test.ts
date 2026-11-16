@@ -4509,17 +4509,18 @@ describe("AWS Bedrock as the last resort", () => {
   const bedrock = { ...account("claude-bedrock", "bedrock", "managed"), auth: "api" as const, provider: "bedrock" as const, identity: "bedrock|eu-central-1|host" };
   const onlyMain = { accounts: [account(MAIN, "main", "main"), bedrock] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} };
 
-  it("isn't used with paid API fallback off (the default): the agent stays at its limit", async () => {
-    const { store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
+  it("isn't used with paid API fallback off: the agent stays at its limit", async () => {
+    const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
+    // Off is upstream's default; this build turns it on by default (see shared/preferences.ts).
+    service.setPreferences(preferences.schema.parse({ paidApiFallback: false }));
     await limitTurn();
     expect((await store.read()).sessions[AGENT]?.accountId).not.toBe(bedrock.id);
     expect(reopened).toEqual([]);
     expect(notes.at(-1)).toMatchObject({ outcome: "stayed" });
   });
 
-  it("with it on, takes a limited agent over in place, says it's a paid API, and doesn't pin it there", async () => {
-    const { service, store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
-    service.setPreferences(preferences.schema.parse({ paidApiFallback: true }));
+  it("with it on (this build's default), takes a limited agent over in place, says it's a paid API, and doesn't pin it there", async () => {
+    const { store, reopened, notes, limitTurn } = await setUp(onlyMain, window);
     await limitTurn();
     const state = await store.read();
     expect(state.sessions[AGENT]?.accountId).toBe(bedrock.id);

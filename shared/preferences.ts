@@ -50,13 +50,18 @@ export const preferences = defineSettings({
      */
     codexSameConversation: z.boolean().default(false),
     /**
-     * Off unless turned on. When every subscription account of a provider is out (at its limit,
-     * signed out or disabled), routing may move agents onto a paid API account that stands in for
-     * one (an Azure OpenAI account under ChatGPT, an AWS Bedrock account under Claude), billed per
-     * token; a banked reset goes first when `autoRedeem` is on. Off, such an account is only used
-     * when picked for an agent or made the default, like any API-key account.
+     * When every subscription account of a provider is out (at its limit, signed out or disabled),
+     * routing may move agents onto a paid API account that stands in for one (an Azure OpenAI
+     * account under ChatGPT, an AWS Bedrock account under Claude), billed per token; a banked reset
+     * goes first when `autoRedeem` is on. Off, such an account is only used when picked for an agent
+     * or made the default, like any API-key account.
+     *
+     * DEPLOYMENT DIVERGENCE (this personal build only): on by default, so agents without a fallback
+     * chain fall back to Azure/Bedrock by themselves, as the old fork did. Upstream and the Azure and
+     * Bedrock PRs default it to off; set this back to `false` (and `DEFAULT_PREFERENCES` in
+     * server/service.ts) to follow them.
      */
-    paidApiFallback: z.boolean().default(false),
+    paidApiFallback: z.boolean().default(true),
     /** Show the account pill in the composer of Claude and Codex agents. */
     showComposerPill: z.boolean().default(true),
   }),
