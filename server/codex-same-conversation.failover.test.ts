@@ -346,3 +346,50 @@ describe("Codex same-conversation failover", () => {
     expect(t.notes.at(-1)).toMatchObject(row);
   });
 });
+
+// Fallback chains (this fork) with the opt-in same-agent Codex conversation.
+describe("Codex same-conversation failover on a fallback chain", () => {
+  async function onChain(options: Parameters<typeof setup>[0]) {
+    const t = await setup(options);
+    await t.store.update((draft) => {
+      draft.chains = [{ id: "work", name: "Work", steps: [{ source: "codex", accountId: null, model: null, thinking: null }], auto: false }];
+      draft.chainsSeeded = true;
+      draft.agentChains.root = { chainId: "work", step: 0, manual: false, at: "2026-10-01T00:00:00.000Z" };
+    });
+    return t;
+  }
+
+  it("keeps the agent and its chain when the conversation stays on it, with no link to another agent", async () => {
+    const t = await onChain({ sameConversation: true });
+    await t.endTurn(LIMIT);
+    expect(t.created).toEqual([]);
+    const state = await t.store.read();
+    expect(state.sessions.root?.accountId).toBe("b");
+    expect(state.agentChains.root).toMatchObject({ chainId: "work" });
+    expect(state.links).toEqual({});
+    expect(t.notes.at(-1)).toMatchObject({ outcome: "switched", sameConversation: true });
+  });
+
+  it("links the new tab both ways and gives it the chain when the resume fails", async () => {
+    const t = await onChain({ sameConversation: true });
+    await t.endTurn(LIMIT);
+    await t.endTurn(DECRYPT);
+    expect(t.created).toHaveLength(1);
+    const tab = t.created[0]!.agentId!;
+    const state = await t.store.read();
+    expect(state.agentChains[tab]).toMatchObject({ chainId: "work", step: 0 });
+    expect(state.links.root?.next).toMatchObject({ agentId: tab });
+    expect(state.links[tab]?.previous).toMatchObject({ agentId: "root" });
+    expect(t.notes.at(-1)).toMatchObject({ outcome: "continued", continuedIn: { agentId: tab } });
+  });
+
+  it("links the new tab when the option is off", async () => {
+    const t = await onChain({});
+    await t.endTurn(LIMIT);
+    expect(t.created).toHaveLength(1);
+    const tab = t.created[0]!.agentId!;
+    const state = await t.store.read();
+    expect(state.agentChains[tab]).toMatchObject({ chainId: "work" });
+    expect(state.links.root?.next).toMatchObject({ agentId: tab });
+  });
+});

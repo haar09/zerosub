@@ -6,6 +6,7 @@ import type { FamilyAdapter, Identity, LoginHandle } from "./adapter";
 import type { FamilyResolver } from "./families";
 import { claudeHomeHoldsAccount } from "./homes";
 import { chooseHomesDir } from "./placement";
+import { isBroken, stepAccount, stepAvailable, stepOf } from "./chains";
 import type { Reopener } from "./reopen";
 import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, findAccount, type StoredState } from "./state";
@@ -683,5 +684,56 @@ describe("adding a folder that's already signed in", () => {
     expect((await store.read()).cleanup).toEqual({});
     expect(await homeOf(store, "claude-aaaaaaaaaaaa")).toBe(join(kept(), "claude-ada"));
     expect([...fake.keychain]).toEqual([[join(kept(), "claude-ada"), "token"]]);
+  });
+});
+
+describe("fallback chains (this fork) and accounts' folders", () => {
+  const pool = { source: "claude" as const, accountId: null, model: null, thinking: null };
+  const keyStep = (accountId: string) => ({ source: "account" as const, accountId, model: null, thinking: null });
+
+  it("keep a chain's API-key step, and the agents on it, when the account's folder moves", async () => {
+    const { service, store } = start();
+    const home = join(homes(), "claude-bbbbbbbbbbbb");
+    await makeHome(home);
+    const steps = [pool, keyStep("claude-bbbbbbbbbbbb")];
+    const agentChains = { "agent-1": { chainId: "work", step: 1, manual: true, at: "2026-11-15T10:00:00.000Z" } };
+    await seed({
+      accounts: [main, { ...managed("claude-bbbbbbbbbbbb", "Gateway", home), auth: "api" }],
+      chains: [{ id: "work", name: "Work", steps, auto: false }],
+      defaultChain: "work",
+      chainsSeeded: true,
+      agentChains,
+    });
+
+    await service.placeHomes();
+    const state = await store.read();
+    const moved = join(kept(), "claude-gateway");
+    expect(await homeOf(store, "claude-bbbbbbbbbbbb")).toBe(moved);
+    expect(state.chains).toEqual([{ id: "work", name: "Work", steps, auto: false }]);
+    expect(state.agentChains).toEqual(agentChains);
+    expect(isBroken(state, steps[1]!)).toBe(false);
+    expect(stepAccount(state, steps[1]!)?.home).toBe(moved);
+    const view = await service.view(paseo);
+    expect(view.chains?.[0]?.steps.map((step) => step.status)).not.toContain("broken");
+  });
+
+  it("count a Claude account added from its folder in the Claude subscription step", async () => {
+    const { service, store, fake } = start();
+    const folder = join(root, "elsewhere", "claude-mine");
+    await mkdir(folder, { recursive: true });
+    await writeFile(join(folder, ".claude.json"), "{}");
+    fake.signedIn.add(folder);
+    fake.emails.set(folder, "mine@example.com");
+    const chain = { id: "work", name: "Work", steps: [pool, keyStep("claude-bbbbbbbbbbbb")], auto: false };
+    // The CLI login is at its limit: only the added folder leaves the step room.
+    await seed({ accounts: [{ ...main, limitedUntil: new Date(Date.now() + 60 * 60_000).toISOString() }], chains: [chain], chainsSeeded: true });
+
+    const id = await service.importAccount(folder);
+    const state = await store.read();
+    const imported = findAccount(state, id)!;
+    expect(stepOf(state, chain, imported)).toBe(0);
+    expect(stepAvailable(state, pool, Date.now())).toBe(true);
+    // Importing doesn't touch the chains.
+    expect(state.chains).toEqual([chain]);
   });
 });

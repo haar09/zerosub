@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AccountView, StateView } from "../shared/model";
-import { setNextAgentAccount } from "../shared/rpc";
+import { setAgentChain, setNextAgentAccount } from "../shared/rpc";
 import { contributeCommands } from "./commands";
 
 function account(status: AccountView["status"], nextAgentUntil: string | null): AccountView {
@@ -88,5 +88,55 @@ describe("next new agent commands", () => {
     for (const status of ["signed_out", "disabled"] as const) {
       expect(titles(status).filter((title) => title.includes("next new") || title.startsWith("Next new")), status).toEqual([]);
     }
+  });
+});
+
+describe("/chain", () => {
+  async function chainCommand() {
+    const commands: Array<{ name: string; onSubmit(context: unknown): Promise<void> }> = [];
+    const client = {
+      addCommandCenterItem: () => () => undefined,
+      addSlashCommand: (command: (typeof commands)[number]) => {
+        commands.push(command);
+        return () => undefined;
+      },
+    };
+    const state: StateView = {
+      accounts: [account("ready", null)],
+      agents: [],
+      logins: [],
+      providers: { claude: "claude" },
+      canReopen: false,
+      browserSignIn: true,
+      showComposerPill: false,
+      autoSwitch: true,
+      warnings: [],
+      launchers: null,
+      piLaunchers: null,
+      piHomes: null,
+      claudeHomes: null,
+      openCodeAvailable: false,
+      chains: [
+        { id: "work", name: "Work", isDefault: true, auto: false, steps: [] },
+        { id: "cheap", name: "Cheap first", isDefault: false, auto: false, steps: [] },
+      ],
+    };
+    const rpc = vi.fn(async () => ({ ok: true, chain: null }));
+    const store = { current: { state, error: null, updatedAt: 0 }, subscribe: () => () => undefined, rpc, refresh: async () => undefined };
+    contributeCommands(client as never, store as never);
+    const command = commands.find((entry) => entry.name === "chain")!;
+    const run = (args: string) => command.onSubmit({ args, agent: { id: "agent-1", provider: "claude" }, openSurface: () => undefined });
+    return { run, rpc };
+  }
+
+  it("sets a chain by name, follows the default, or turns it off", async () => {
+    const { run, rpc } = await chainCommand();
+    await run("cheap");
+    expect(rpc).toHaveBeenLastCalledWith(setAgentChain, { agentId: "agent-1", mode: "chain", chainId: "cheap" });
+    await run("default");
+    expect(rpc).toHaveBeenLastCalledWith(setAgentChain, { agentId: "agent-1", mode: "default" });
+    await run("OFF");
+    expect(rpc).toHaveBeenLastCalledWith(setAgentChain, { agentId: "agent-1", mode: "off" });
+    await expect(run("nope")).rejects.toThrow(/No chain matches "nope". Chains: Work, Cheap first/);
   });
 });
