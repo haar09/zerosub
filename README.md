@@ -293,6 +293,8 @@ On a chain, the chain's order replaces both the **fork to the other provider** t
 - The chain providers rely on Paseo's config API (`config.patch` of `providers` and `removeProviders`) and its `extends` providers, as in Paseo 0.15; the session-open hook doesn't name the Agent profile used, so the chain comes from the provider.
 - Tested with unit tests and type checks, not yet against a live Paseo daemon.
 
+**Upgrading from the fork's earlier builds.** The registry (`state.json`) of the earlier `chains` build loads as it is: its chains, default chain, agents' chains and links keep their fields. Its Azure OpenAI and Bedrock accounts were plain API accounts without the `provider` marker these builds go by, so on start ZeroSub marks them once: a ChatGPT (Codex) API account whose home has `azure.json` becomes an Azure OpenAI account, a Claude API account whose home has `bedrock.json` a Bedrock account, and the log names each. Their `azure.json`, `bedrock.json` and `api-usage.json` are read as before. A registry from this fork's builds before v1.12.0 loads whole as well. From v1.12.0 on, added Claude accounts' folders (subscriptions and API keys, not Bedrock's) move out of ZeroSub's `homes/` to `~/.claude-config` once nothing runs on them, as upstream; accounts keep their IDs, so chains, agents' chains and links don't change.
+
 Install this fork on a Paseo host with `paseo plugin install github:haar09/zerosub` (remove the upstream `zerosub` plugin first if it's installed: both use the id `zerosub`).
 
 ## Pi accounts

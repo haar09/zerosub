@@ -70,6 +70,7 @@ import {
   type UsageRead,
 } from "./adapter";
 import { FamilyResolver } from "./families";
+import { markApiProviders } from "./provider-marker";
 import { chainForProvider, isChainProviderId, planChainProviders, planChanges, providersInConfig } from "./chain-providers";
 import { sameAccountIdentity, withoutWorkspace } from "./account-identity";
 import { ApiUsageStore, currentMonth, type ApiUsageFile } from "./api-usage";
@@ -605,6 +606,8 @@ export class Service {
     this.starting ??= (async () => {
       // The last readings show right away; fresh ones replace them as they arrive.
       for (const [accountId, reading] of await loadReadings()) if (!this.usage.has(accountId)) this.usage.set(accountId, reading);
+      // Before anything routes or seeds chains: the old fork's Azure and Bedrock accounts carry no provider marker.
+      await this.markApiProviders();
       await Promise.all(FAMILIES.map((family) => this.ensureFamily(family)));
       await this.seedChains();
       this.started = true;
@@ -2077,6 +2080,19 @@ export class Service {
     if (routed && routed.account.id !== exhausted && !routed.skipped) return { account: routed.account, pin: false };
     const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), Date.now(), new Set([exhausted]), allowPaid);
     return roomiest && { account: roomiest, pin: true };
+  }
+
+  /**
+   * Marks the Azure OpenAI and AWS Bedrock accounts a registry from the old fork has as plain API
+   * accounts (see server/provider-marker.ts). Writes, and logs, only when there's one to mark.
+   */
+  private async markApiProviders(): Promise<void> {
+    if (markApiProviders(structuredClone(await this.store.read())).length === 0) return;
+    let marked: string[] = [];
+    await this.store.update((draft) => {
+      marked = markApiProviders(draft);
+    });
+    if (marked.length > 0) console.log(`[ZeroSub] marked accounts from an earlier build by their paid API: ${marked.join(", ")}`);
   }
 
   // ------------------------------------------------------------------ fallback chains (this fork)
