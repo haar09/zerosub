@@ -5,6 +5,8 @@ export interface ModeInfo {
   id: string;
   label?: string;
   colorTier?: string | null;
+  /** Paseo's icon for the mode; modes of different providers that work alike share one (e.g. `ShieldCheck` for automatic review). */
+  icon?: string | null;
 }
 
 function tierOf(mode: ModeInfo | undefined): number {
@@ -13,24 +15,27 @@ function tierOf(mode: ModeInfo | undefined): number {
 
 /**
  * The other provider's mode whose Paseo tier is no higher than the source agent's: the same tier if
- * it has one, otherwise the closest more careful one (first listed wins a tie). `null` when it has
- * nothing that careful, or the source mode is unknown. Tiers order modes; they don't make two
- * providers' policies equivalent.
+ * it has one, otherwise the closest more careful one. Within that tier the mode with the source's
+ * icon wins (Claude's "Auto mode" and Codex's "Auto-review" both review prompts automatically and
+ * share one), else the first listed. `null` when it has nothing that careful, or the source mode is
+ * unknown. Tiers order modes; they don't make two providers' policies equivalent.
  */
 export function equivalentMode(
   sourceModes: readonly ModeInfo[],
   sourceModeId: string | null | undefined,
   targetModes: readonly ModeInfo[],
 ): string | null {
-  const ceiling = tierOf(sourceModes.find((mode) => mode.id === sourceModeId));
+  const source = sourceModes.find((mode) => mode.id === sourceModeId);
+  const ceiling = tierOf(source);
   if (ceiling < 0) return null;
-  let best: { id: string; tier: number } | null = null;
+  let best: { mode: ModeInfo; tier: number } | null = null;
   for (const mode of targetModes) {
     const tier = tierOf(mode);
     if (tier < 0 || tier > ceiling) continue;
-    if (!best || tier > best.tier) best = { id: mode.id, tier };
+    const alike = Boolean(source?.icon) && mode.icon === source?.icon && best?.mode.icon !== source?.icon;
+    if (!best || tier > best.tier || (tier === best.tier && alike)) best = { mode, tier };
   }
-  return best?.id ?? null;
+  return best?.mode.id ?? null;
 }
 
 /**

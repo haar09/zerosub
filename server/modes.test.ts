@@ -3,24 +3,33 @@ import { equivalentMode, withinMode } from "./modes";
 
 // As Paseo 0.9.1 lists them.
 const CLAUDE = [
-  { id: "plan", colorTier: "planning" },
-  { id: "default", colorTier: "safe" },
-  { id: "acceptEdits", colorTier: "moderate" },
-  { id: "auto", colorTier: "moderate" },
-  { id: "bypassPermissions", colorTier: "dangerous" },
+  { id: "plan", colorTier: "planning", icon: "ShieldEllipsis" },
+  { id: "default", colorTier: "safe", icon: "Shield" },
+  { id: "acceptEdits", colorTier: "moderate", icon: "ShieldPlus" },
+  { id: "auto", colorTier: "moderate", icon: "ShieldCheck" },
+  { id: "bypassPermissions", colorTier: "dangerous", icon: "ShieldOff" },
 ];
 const CODEX = [
-  { id: "auto", colorTier: "moderate" },
-  { id: "auto-review", colorTier: "moderate" },
-  { id: "full-access", colorTier: "dangerous" },
+  { id: "auto", colorTier: "moderate", icon: "Shield" },
+  { id: "auto-review", colorTier: "moderate", icon: "ShieldCheck" },
+  { id: "full-access", colorTier: "dangerous", icon: "ShieldOff" },
 ];
+const bare = (modes: typeof CLAUDE) => modes.map(({ icon: _icon, ...mode }) => mode);
 
 describe("equivalentMode", () => {
   it("keeps the same permission tier across providers", () => {
     expect(equivalentMode(CLAUDE, "bypassPermissions", CODEX)).toBe("full-access");
     expect(equivalentMode(CLAUDE, "acceptEdits", CODEX)).toBe("auto");
     expect(equivalentMode(CODEX, "full-access", CLAUDE)).toBe("bypassPermissions");
-    expect(equivalentMode(CODEX, "auto-review", CLAUDE)).toBe("acceptEdits");
+    expect(equivalentMode(CODEX, "auto", CLAUDE)).toBe("acceptEdits");
+  });
+
+  it("prefers the mode that works alike within a tier: Claude's Auto mode and Codex's Auto-review", () => {
+    expect(equivalentMode(CLAUDE, "auto", CODEX)).toBe("auto-review");
+    expect(equivalentMode(CODEX, "auto-review", CLAUDE)).toBe("auto");
+    // Without icons (an older daemon), the first listed of the tier, as before.
+    expect(equivalentMode(bare(CLAUDE), "auto", bare(CODEX))).toBe("auto");
+    expect(equivalentMode(bare(CODEX), "auto-review", bare(CLAUDE))).toBe("acceptEdits");
   });
 
   it("never picks a more permissive mode than the original had", () => {

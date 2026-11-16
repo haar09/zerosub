@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { MAX_CHAIN_STEPS, POOL_LABEL, chainAccountKind, isChainAccount, type Chain, type ChainStep, type ChainStepView, type ChainView } from "../shared/chains";
+import { BEDROCK_UNSUPPORTED_MODE, MAX_CHAIN_STEPS, POOL_LABEL, chainAccountKind, isChainAccount, type Chain, type ChainModes, type ChainStep, type ChainStepView, type ChainView } from "../shared/chains";
 import { FAMILY_LABEL, isAzureAccount, isBedrockAccount, type Family } from "../shared/model";
 import { publishedEntry } from "./chain-providers";
 import { canStandIn, isUsable } from "./routing";
@@ -125,7 +125,7 @@ export function seededSteps(state: StoredState): ChainStep[] {
   const subscribed = (family: ChainFamily) =>
     accountsOf(state, family).some((account) => account.auth !== "api" && account.signedIn);
   const steps: ChainStep[] = [];
-  const blank = { model: null, thinking: null };
+  const blank = { model: null, thinking: null, modeId: null };
   if (subscribed("claude")) steps.push({ source: "claude", accountId: null, ...blank });
   if (subscribed("codex")) steps.push({ source: "codex", accountId: null, ...blank });
   for (const account of state.accounts.filter(isBedrockAccount)) steps.push({ source: "account", accountId: account.id, ...blank });
@@ -166,8 +166,11 @@ export function newChainId(): string {
   return `chain-${randomBytes(4).toString("hex")}`;
 }
 
-/** Checks a chain the user saves; returns the problem, or null. */
-export function chainProblem(state: StoredState, chain: Pick<Chain, "id" | "name" | "steps">): string | null {
+/**
+ * Checks a chain the user saves; returns the problem, or null. `modes` (each family's modes, when
+ * known) also checks that a step's permission mode is one its provider has.
+ */
+export function chainProblem(state: StoredState, chain: Pick<Chain, "id" | "name" | "steps">, modes?: ChainModes): string | null {
   const name = chain.name.trim();
   if (!name) return "Give the chain a name.";
   if (state.chains.some((other) => other.id !== chain.id && other.name.trim().toLowerCase() === name.toLowerCase())) {
@@ -181,7 +184,16 @@ export function chainProblem(state: StoredState, chain: Pick<Chain, "id" | "name
       const account = findAccount(state, step.accountId);
       if (!account || !isChainAccount(account)) return `Step ${index + 1}: pick an AWS Bedrock, Claude API-key or Azure OpenAI account.`;
     }
-    const key = JSON.stringify([step.source, step.accountId, step.model ?? null, step.thinking ?? null]);
+    const family = stepFamily(state, step);
+    const onBedrock = step.source === "account" ? findAccount(state, step.accountId) : undefined;
+    if (step.modeId === BEDROCK_UNSUPPORTED_MODE && onBedrock && isBedrockAccount(onBedrock)) {
+      return `Step ${index + 1}: AWS Bedrock can't run Claude's Auto mode. Pick another permission mode for this step.`;
+    }
+    const known = family ? modes?.[family] : null;
+    if (step.modeId && known && !known.some((mode) => mode.id === step.modeId)) {
+      return `Step ${index + 1}: ${FAMILY_LABEL[family!]} has no permission mode “${step.modeId}”. Pick one from its list.`;
+    }
+    const key = JSON.stringify([step.source, step.accountId, step.model ?? null, step.thinking ?? null, step.modeId ?? null]);
     if (seen.has(key)) return `Step ${index + 1} repeats an earlier step.`;
     seen.add(key);
   }

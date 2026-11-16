@@ -11,6 +11,7 @@ import { Service } from "./service";
 import { StateStore, StoredAccountSchema, type StoredAccount } from "./state";
 import { preferences } from "../shared/preferences";
 import type { SwitchRow } from "../shared/timeline";
+import type { ChainStep } from "../shared/chains";
 import { absentPi } from "./fakes.test-support";
 
 type PaseoApi = PluginHookContext["paseo"];
@@ -134,7 +135,16 @@ async function setup(options: {
     };
   };
   const paseo = {
-    providers: { listModels: async () => ({ models: [{ id: "synthetic-model", isDefault: true }] }) },
+    providers: {
+      listModels: async () => ({ models: [{ id: "synthetic-model", isDefault: true }] }),
+      listModes: async () => ({
+        modes: [
+          { id: "auto", label: "Default Permissions", colorTier: "moderate" },
+          { id: "auto-review", label: "Auto-review", colorTier: "moderate" },
+          { id: "full-access", label: "Full Access", colorTier: "dangerous" },
+        ],
+      }),
+    },
     workspaces: { ref: () => ({ agents: { create } }) },
     agents: {
       create,
@@ -349,10 +359,17 @@ describe("Codex same-conversation failover", () => {
 
 // Fallback chains (this fork) with the opt-in same-agent Codex conversation.
 describe("Codex same-conversation failover on a fallback chain", () => {
-  async function onChain(options: Parameters<typeof setup>[0]) {
+  const codexStep = (modeId: string | null = null) => ({ source: "codex" as const, accountId: null, model: null, thinking: null, modeId });
+  const azureStep = (modeId: string | null = null) => ({ source: "account" as const, accountId: "z", model: null, thinking: null, modeId });
+  async function onChain(options: Parameters<typeof setup>[0], steps: ChainStep[] = [codexStep()]) {
     const t = await setup(options);
     await t.store.update((draft) => {
-      draft.chains = [{ id: "work", name: "Work", steps: [{ source: "codex", accountId: null, model: null, thinking: null }], auto: false }];
+      if (steps.some((step) => step.accountId === "z")) {
+        // ChatGPT's other subscription is out too, so the chain moves on to its Azure step.
+        draft.accounts.find((entry) => entry.id === "b")!.limitedUntil = new Date(Date.now() + 3_600_000).toISOString();
+        draft.accounts.push(StoredAccountSchema.parse({ ...account("z", "azure|z", null, "managed"), auth: "api", provider: "azure", label: "Z" }));
+      }
+      draft.chains = [{ id: "work", name: "Work", steps, auto: false }];
       draft.chainsSeeded = true;
       draft.agentChains.root = { chainId: "work", step: 0, manual: false, at: "2026-10-01T00:00:00.000Z" };
     });
@@ -391,5 +408,29 @@ describe("Codex same-conversation failover on a fallback chain", () => {
     const state = await t.store.read();
     expect(state.agentChains[tab]).toMatchObject({ chainId: "work" });
     expect(state.links.root?.next).toMatchObject({ agentId: tab });
+  });
+
+  it("starts the next step's ChatGPT tab in the permission mode the step sets", async () => {
+    const t = await onChain({}, [codexStep(), azureStep("auto-review")]);
+    await t.endTurn(LIMIT);
+    expect(t.created).toHaveLength(1);
+    // The source tab runs in Full Access; the step asks for Auto-review, so the new tab gets that.
+    expect(t.created[0]!.config).toMatchObject({ modeId: "auto-review" });
+    const tab = t.created[0]!.agentId!;
+    expect((await t.store.read()).agentChains[tab]).toMatchObject({ chainId: "work", step: 1 });
+    expect(t.notes.at(-1)).toMatchObject({ outcome: "continued", continuedIn: { agentId: tab }, detail: null, chain: { step: 2, mode: "Auto-review" } });
+  });
+
+  it("keeps the source tab's mode for a step without one, or with one ChatGPT doesn't have, and says so", async () => {
+    const plain = await onChain({}, [codexStep(), azureStep()]);
+    await plain.endTurn(LIMIT);
+    expect(plain.created[0]!.config).toMatchObject({ modeId: "full-access" });
+    expect(plain.notes.at(-1)?.chain?.mode).toBeUndefined();
+
+    const odd = await onChain({}, [codexStep(), azureStep("no-such-mode")]);
+    await odd.endTurn(LIMIT);
+    expect(odd.created[0]!.config).toMatchObject({ modeId: "full-access" });
+    expect(odd.notes.at(-1)).toMatchObject({ outcome: "continued" });
+    expect(odd.notes.at(-1)?.detail).toMatch(/Step 2's permission mode “no-such-mode” isn't one this provider has here, so the new tab keeps this agent's mode/);
   });
 });

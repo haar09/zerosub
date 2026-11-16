@@ -172,16 +172,21 @@ export class CodexContinuations {
     }
   }
 
-  continue(paseo: PaseoApi, sourceAgentId: string, target: StoredAccount, why: string, source: Source): Promise<Continuation> {
+  /**
+   * Hands the task on to `target`'s tab. `modeId` is the permission mode that tab must run in (a
+   * fallback chain step's); without one it's the source tab's, as a continuation within one provider
+   * carries the mode over.
+   */
+  continue(paseo: PaseoApi, sourceAgentId: string, target: StoredAccount, why: string, source: Source, modeId?: string): Promise<Continuation> {
     const key = `${sourceAgentId}:${target.id}`;
     const existing = this.inFlight.get(key);
     if (existing) return existing;
-    const task = this.dispatch(paseo, sourceAgentId, target, why, source).finally(() => this.inFlight.delete(key));
+    const task = this.dispatch(paseo, sourceAgentId, target, why, source, modeId).finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, task);
     return task;
   }
 
-  private async dispatch(paseo: PaseoApi, sourceAgentId: string, target: StoredAccount, why: string, source: Source): Promise<Continuation> {
+  private async dispatch(paseo: PaseoApi, sourceAgentId: string, target: StoredAccount, why: string, source: Source, modeId?: string): Promise<Continuation> {
     const original = await snapshot(paseo, sourceAgentId);
     if (!original || original.archivedAt) throw new Error("The original agent is no longer available.");
     const { root, ancestors } = await findTask(paseo, await this.store.read(), original);
@@ -199,7 +204,8 @@ export class CodexContinuations {
         throw new Error("That ChatGPT account is no longer available. Enable it, sign in or wait for its limit to reset.");
       }
       const snapshots = await memberSnapshots(paseo, chain, sourceAgent);
-      const destination = pickDestination(state, chain, snapshots, sourceAgent, account, reserved);
+      const mode = modeId ?? sourceAgent.currentModeId;
+      const destination = pickDestination(state, chain, snapshots, sourceAgent, account, reserved, mode);
       const gathered = await gatherUpdates(paseo, state, chain, snapshots, sourceAgent, destination);
       const prompt = composePrompt(chain, destination, gathered, why, Boolean(reserved));
       const messageId = reserved?.messageId ?? `${MESSAGE_PREFIX}${randomUUID()}`;
@@ -207,7 +213,7 @@ export class CodexContinuations {
       if (!destination.agent) destination.parent = reserved ? reserved.parent : await this.parentFor(paseo, sourceAgent.id);
       await this.confirmUnchanged(paseo, sourceAgent, destination, account);
       await this.reserve(root, sourceAgent.id, destination, gathered, account, messageId, source);
-      return this.deliver(paseo, root, sourceAgent, destination, account, prompt, messageId, why);
+      return this.deliver(paseo, root, sourceAgent, destination, account, prompt, messageId, why, modeId);
     });
   }
 
@@ -337,6 +343,7 @@ export class CodexContinuations {
     prompt: string,
     messageId: string,
     why: string,
+    modeId?: string,
   ): Promise<Continuation> {
     const { targetId } = destination;
     let result: Continuation;
@@ -350,6 +357,7 @@ export class CodexContinuations {
         agentId: targetId,
         deferPrompt: true,
         parentId: destination.parent,
+        ...(modeId ? { modeId } : {}),
         bind: async () => {},
       });
       // Creation can take time. A user may have started another turn or disabled the account.
@@ -357,7 +365,7 @@ export class CodexContinuations {
       const sourceNow = await snapshot(paseo, sourceAgent.id);
       const state = await this.store.read();
       const createdOk = created !== undefined && ready(created) && samePlace(sourceAgent, created) && !created.lastUserMessageAt &&
-        created.currentModeId === sourceAgent.currentModeId && boundTo(state, targetId, account.id);
+        created.currentModeId === (modeId ?? sourceAgent.currentModeId) && boundTo(state, targetId, account.id);
       if (!untouched(sourceAgent, sourceNow) || !createdOk || !stillUsable(state, account)) {
         throw new Error("The task or account changed while its tab was being created. Check the active tab and retry the switch.");
       }
@@ -515,6 +523,8 @@ function pickDestination(
   sourceAgent: Agent,
   account: StoredAccount,
   reserved: Pending | undefined,
+  /** The permission mode the destination tab must run in. */
+  modeId: string | null | undefined = sourceAgent.currentModeId,
 ): Destination {
   const candidate = Object.entries(chain.members).find(([id, entry]) => {
     const agent = snapshots.get(id);
@@ -533,8 +543,12 @@ function pickDestination(
     throw new Error(`The unstarted tab ${targetId} received another message. Check it and archive it before retrying.`);
   }
   if (!ready(agent)) throw new Error("The account's existing tab isn't ready to continue. Check it before switching.");
-  if (agent.currentModeId !== sourceAgent.currentModeId) {
-    throw new Error(`The existing tab ${targetId} has a different permission mode. Align its mode with the current tab before switching.`);
+  if (agent.currentModeId !== modeId) {
+    throw new Error(
+      modeId === sourceAgent.currentModeId
+        ? `The existing tab ${targetId} has a different permission mode. Align its mode with the current tab before switching.`
+        : `The existing tab ${targetId} isn't in the permission mode “${modeId}” the chain's step sets. Change its mode before switching.`,
+    );
   }
   // Anything the user typed in this tab while it was parked is part of the task; it already knows it.
   return { targetId, agent, entry };

@@ -33,6 +33,7 @@ import {
   updateBedrockAccount,
   detectBedrockRegion,
   saveChain,
+  listChainModes,
   deleteChain,
   setDefaultChain,
   setAgentChain,
@@ -134,6 +135,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(importAccount, async ({ path }) => ({ accountId: await service.importAccount(path) }));
   server.handle(setPiHomesDir, async ({ dir }) => ({ ok: true as const, ...(await service.setPiHomesDir(dir)) }));
   server.handle(saveChain, (input, { paseo }) => service.saveChain(input, paseo));
+  server.handle(listChainModes, (_input, { paseo }) => service.chainModes(paseo));
   server.handle(deleteChain, async ({ id }, { paseo }) => {
     await service.deleteChain(id, paseo);
     return { ok: true as const };

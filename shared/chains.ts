@@ -19,10 +19,39 @@ export const ChainStepSchema = z.object({
   model: z.string().trim().max(200).nullable().default(null),
   /** The thinking option an agent created for this step starts with; empty uses the provider's default. */
   thinking: z.string().trim().max(100).nullable().default(null),
+  /**
+   * The permission mode (a Paseo mode ID of the step's provider, e.g. `full-access`) an agent created
+   * for this step starts in: a fork to the other provider, or a ChatGPT continuation tab. Null (and
+   * absent on steps saved before there was one) matches the original agent: its own mode within a
+   * provider, and across providers the closest mode that allows no more than it (see server/modes.ts).
+   */
+  modeId: z.string().trim().max(200).nullable().default(null),
 });
 export type ChainStep = z.infer<typeof ChainStepSchema>;
 
 export const MAX_CHAIN_STEPS = 12;
+
+/**
+ * Claude's Auto mode, as Paseo names it. Paseo won't start a turn in it on AWS Bedrock ("Claude Auto
+ * mode requires the Anthropic API"), so a Bedrock step can't set it, and an agent in it skips one.
+ */
+export const BEDROCK_UNSUPPORTED_MODE = "auto";
+
+/** A provider's permission mode as Paseo lists it, for a chain step's permission picker. */
+export const ChainModeSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  /** Paseo's tier: `planning`, `safe`, `moderate` or `dangerous`. */
+  colorTier: z.string().nullable().default(null),
+});
+export type ChainMode = z.infer<typeof ChainModeSchema>;
+
+/** Each chain family's permission modes; null when the daemon couldn't list them. */
+export const ChainModesSchema = z.object({
+  claude: z.array(ChainModeSchema).nullable(),
+  codex: z.array(ChainModeSchema).nullable(),
+});
+export type ChainModes = z.infer<typeof ChainModesSchema>;
 
 export const ChainSchema = z.object({
   id: z.string(),

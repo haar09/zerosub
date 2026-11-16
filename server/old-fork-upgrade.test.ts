@@ -10,6 +10,7 @@ import { readBedrockAccount } from "./bedrock";
 import { stepFamily } from "./chains";
 import { absentPi } from "./fakes.test-support";
 import type { FamilyResolver } from "./families";
+import { deployBd192c7State } from "./deploy-bd192c7-state.test-support";
 import { OLD_AZURE_FILE, OLD_BEDROCK_FILE, OLD_BEDROCK_KEYS_FILE, deployState, oldApiUsage, oldForkState } from "./old-fork-state.test-support";
 import { markApiProviders } from "./provider-marker";
 import type { Reopener } from "./reopen";
@@ -21,6 +22,11 @@ let root: string;
 let homes: string;
 let savedPaseo: string | undefined;
 const services: Service[] = [];
+
+/** Chains as loaded now: steps saved before steps had a permission mode get none (null, "match the original"). */
+function withStepModes<T extends { steps: object[] }>(chains: readonly T[]): T[] {
+  return chains.map((chain) => ({ ...chain, steps: chain.steps.map((step) => ({ ...step, modeId: null })) }));
+}
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "zerosub-old-fork-"));
@@ -102,7 +108,9 @@ describe("a registry written by the old fork", () => {
   it("loads with its chains, default chain, agents' chains and links exactly as they were", async () => {
     const { path, fixture } = await writeOldState();
     const state = await new StateStore(path).read();
-    expect(state.chains).toEqual(fixture.chains);
+    expect(state.chains).toEqual(withStepModes(fixture.chains));
+    expect(fixture.chains.flatMap((chain) => chain.steps).some((step) => "modeId" in step)).toBe(false);
+    expect(state.chains.flatMap((chain) => chain.steps).every((step) => step.modeId === null)).toBe(true);
     expect(state.defaultChain).toBe("default");
     expect(state.chainsSeeded).toBe(true);
     expect(state.agentChains).toEqual(fixture.agentChains);
@@ -128,12 +136,12 @@ describe("a registry written by the old fork", () => {
     expect(String(marks()[0]![0])).toContain("Azure (Azure OpenAI), Bedrock (AWS Bedrock)");
 
     // The seeded Default chain still has its Bedrock and Azure steps, none broken; nothing else moved.
-    expect(state.chains).toEqual(fixture.chains);
+    expect(state.chains).toEqual(withStepModes(fixture.chains));
     expect(state.chains[0]!.steps.map((step) => stepFamily(state, step))).toEqual(["claude", "codex", "claude", "codex"]);
     expect(state.agentChains).toEqual(fixture.agentChains);
     expect(state.links).toEqual(fixture.links);
     const saved = JSON.parse(await readFile(path, "utf8")) as ReturnType<typeof oldForkState>;
-    expect(saved.chains).toEqual(fixture.chains);
+    expect(saved.chains).toEqual(withStepModes(fixture.chains));
     expect(saved.agentChains).toEqual(fixture.agentChains);
     expect(saved.links).toEqual(fixture.links);
 
@@ -179,7 +187,7 @@ describe("a registry written by the deployment build before v1.12.0 (4ad6e15)", 
   it("loads whole: every field as it was, and only the new folder setting for Claude accounts and the OpenCode records at their defaults", async () => {
     const { path, fixture } = await writeDeployState();
     const state = await new StateStore(path).read();
-    expect(state).toEqual({ ...fixture, claudeHomes: { dir: null, from: [] }, opencodeForks: {}, opencodeHolds: {} });
+    expect(state).toEqual({ ...fixture, chains: withStepModes(fixture.chains), claudeHomes: { dir: null, from: [] }, opencodeForks: {}, opencodeHolds: {} });
     // Loaded whole, not salvaged: the file wasn't set aside.
     expect(await readFile(path, "utf8")).toBe(JSON.stringify(fixture, null, 2));
     // A move on record from then has no `family`: the account says whose home it is.
@@ -195,7 +203,7 @@ describe("a registry written by the deployment build before v1.12.0 (4ad6e15)", 
     const store = new StateStore(path);
     await service(store).start();
     const state = await store.read();
-    expect(state.chains).toEqual(fixture.chains);
+    expect(state.chains).toEqual(withStepModes(fixture.chains));
     expect(state.defaultChain).toBe(fixture.defaultChain);
     expect(state.chainsSeeded).toBe(true);
     expect(state.agentChains).toEqual(fixture.agentChains);
@@ -209,6 +217,50 @@ describe("a registry written by the deployment build before v1.12.0 (4ad6e15)", 
     expect(byId["claude-key1"]?.provider).toBeUndefined();
     expect(byId["claude-0123456789ab"]).toMatchObject({ home: join(homes, "claude-0123456789ab"), limitSource: "turn", limitKind: "window" });
     // Every chain step still names an account that's there.
+    for (const chain of state.chains) expect(chain.steps.map((step) => stepFamily(state, step))).not.toContain(null);
+  });
+});
+
+describe("a registry written by the deployment build at bd192c7 (chains with a permission mode per step)", () => {
+  async function writeLiveState() {
+    const path = join(root, "paseo", "zerosub", "state.json");
+    await mkdir(join(root, "paseo", "zerosub"), { recursive: true });
+    const fixture = deployBd192c7State({ homes, claudeHomes: join(root, "claude-config"), piHomes: join(root, "pi-config"), oldPiHomes: join(root, "old-pi-config") });
+    const text = `${JSON.stringify(fixture, null, 2)}\n`;
+    await writeFile(path, text);
+    return { path, fixture, text };
+  }
+
+  it("loads whole: every field as it was, and only v1.13.0's OpenCode records at their defaults", async () => {
+    const { path, fixture, text } = await writeLiveState();
+    const state = await new StateStore(path).read();
+    expect(state).toEqual({ ...fixture, opencodeForks: {}, opencodeHolds: {} });
+    // Loaded whole, not salvaged: the file wasn't set aside or rewritten.
+    expect(await readFile(path, "utf8")).toBe(text);
+    // A Bedrock step saved in Claude's Auto mode, which saving refuses now, still loads as it was.
+    expect(state.chains.find((chain) => chain.id === "chain-0a1b2c3d")?.steps[1]).toMatchObject({ accountId: "claude-bedrock1", modeId: "auto" });
+  });
+
+  it("starts on it with the chains, step modes, agents' chains, links, markers and Claude folders as they were", async () => {
+    const { path, fixture } = await writeLiveState();
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const store = new StateStore(path);
+    await service(store).start();
+    const state = await store.read();
+    expect(state.chains).toEqual(fixture.chains);
+    expect(state.defaultChain).toBe(fixture.defaultChain);
+    expect(state.chainsSeeded).toBe(true);
+    expect(state.agentChains).toEqual(fixture.agentChains);
+    expect(state.links).toEqual(fixture.links);
+    expect(state.bindings).toEqual(fixture.bindings);
+    expect(state.claudeHomes).toEqual(fixture.claudeHomes);
+    const byId = Object.fromEntries(state.accounts.map((account) => [account.id, account]));
+    expect(state.accounts.map((account) => account.id)).toEqual(fixture.accounts.map((account) => account.id));
+    expect(byId["codex-azure1"]).toMatchObject({ provider: "azure", home: join(homes, "codex-azure1") });
+    expect(byId["claude-bedrock1"]).toMatchObject({ provider: "bedrock" });
+    expect(byId["claude-key1"]?.provider).toBeUndefined();
+    expect(byId["claude-0123456789ab"]?.home).toBe(join(root, "claude-config", "claude-0123456789ab"));
+    expect(state.opencodeForks).toEqual({});
     for (const chain of state.chains) expect(chain.steps.map((step) => stepFamily(state, step))).not.toContain(null);
   });
 });

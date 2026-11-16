@@ -91,7 +91,8 @@ export function describeRow(row: SwitchRow): string {
 function describeChainRow(row: SwitchRow, chain: NonNullable<SwitchRow["chain"]>): string {
   const reset = formatResetIn(row.resetsAt);
   const detail = row.detail ? ` ${row.detail}` : "";
-  const step = `chain “${chain.name}” step ${chain.step}/${chain.steps}: ${chain.label}${chain.model ? ` (${chain.model})` : ""}`;
+  const extras = [chain.model, chain.mode].filter(Boolean).join(", ");
+  const step = `chain “${chain.name}” step ${chain.step}/${chain.steps}: ${chain.label}${extras ? ` (${extras})` : ""}`;
   if (row.outcome === "stayed") {
     return `${chain.from ?? `${row.from ?? "This account"} is out`}.${detail}${reset ? ` The earliest frees up ${reset}.` : ""}`;
   }

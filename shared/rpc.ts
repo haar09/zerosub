@@ -1,6 +1,6 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { ChainStepSchema, MAX_CHAIN_STEPS } from "./chains";
+import { ChainModesSchema, ChainStepSchema, MAX_CHAIN_STEPS } from "./chains";
 import { ApiKeyKindSchema, ApiPriceSchema, BedrockSourceSchema, FamilySchema, LoginMethodSchema, LoginViewSchema, StateViewSchema, TrafficSwitchesSchema } from "./model";
 
 export const getState = defineRpc({
@@ -318,6 +318,13 @@ export const saveChain = defineRpc({
     picker: z.boolean().optional(),
   }),
   output: z.object({ id: z.string() }),
+});
+
+/** Each chain family's permission modes, for the chain editor's per-step permission picker. */
+export const listChainModes = defineRpc({
+  name: "zerosub.chains.modes",
+  input: z.object({}),
+  output: ChainModesSchema,
 });
 
 export const deleteChain = defineRpc({

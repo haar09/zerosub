@@ -29,6 +29,12 @@ describe("chain notes", () => {
     );
   });
 
+  it("name the permission mode a fork started in", () => {
+    const chain = { name: "Work", step: 2, steps: 3, label: "ChatGPT subscription", model: "gpt-6.1-sol", mode: "Full Access", from: "Claude subscriptions at their limit" };
+    expect(describeRow({ ...base, chain })).toMatch(/^Claude subscriptions at their limit → chain “Work” step 2\/3: ChatGPT subscription \(gpt-6.1-sol, Full Access\)\./);
+    expect(describeRow({ ...base, chain: { ...chain, model: null } })).toMatch(/step 2\/3: ChatGPT subscription \(Full Access\)\./);
+  });
+
   it("say when an agent goes back to an earlier step", () => {
     const row = { ...base, reason: "room" as const, from: "bed", to: "marketing", toFamily: null, continuedIn: null, outcome: "switched" as const };
     expect(describeRow({ ...row, chain: { name: "Work", step: 1, steps: 2, label: "Claude subscription", model: null, from: null } })).toBe(

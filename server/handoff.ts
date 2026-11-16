@@ -291,7 +291,7 @@ export interface ContinuationTarget {
   provider: string;
   /** Its name for people, used in the new agent's title, e.g. `ChatGPT`. */
   label: string;
-  /** The fork's mode. ChatGPT gets one no looser than the source's; OpenCode gets Plan or Build. */
+  /** The fork's mode. ChatGPT gets one no looser than the source's, or one a fallback chain's step names; OpenCode gets Plan or Build. */
   modeId: string;
   /** A model from the host's catalog for this provider (or a fallback chain step's). Empty uses the provider's default. */
   model?: string | null;
@@ -318,6 +318,8 @@ export async function continueInNewAgent(options: {
   agentId?: string;
   /** Create the pre-bound tab first; the caller delivers its handoff separately. */
   deferPrompt?: boolean;
+  /** Within one provider: the new agent's permission mode (a fallback chain step's) instead of the source's. */
+  modeId?: string;
   /**
    * Make the new agent a sub-agent of this one, as the source was of its parent. This sets Paseo's
    * parent label rather than `parent`: on a create, `parent` would also turn the first prompt into
@@ -369,6 +371,7 @@ export async function continueInNewAgent(options: {
   // Modes and thinking options are provider-specific: only carry them over within one provider.
   // `provider/model` is Paseo's config shape: the OpenCode provider id plus the catalog's full model
   // id (which itself may carry a catalog prefix, e.g. `opencode/bifrost-fireworks/…/glm-5p3-flash`).
+  const mode = options.modeId ?? source.currentModeId;
   const config = target
     ? {
         provider: `${provider}/${model}`,
@@ -377,7 +380,7 @@ export async function continueInNewAgent(options: {
       }
     : {
         provider: `${provider}/${model}`,
-        ...(source.currentModeId ? { modeId: source.currentModeId } : {}),
+        ...(mode ? { modeId: mode } : {}),
         ...(source.thinkingOptionId ? { thinkingOptionId: source.thinkingOptionId } : {}),
         ...(source.features ? { featureValues: Object.fromEntries(source.features.map((feature) => [feature.id, feature.value])) } : {}),
       };

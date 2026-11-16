@@ -63,6 +63,8 @@ export const SwitchRowSchema = z.object({
       steps: z.number().int().positive(),
       label: z.string(),
       model: z.string().nullable().default(null),
+      /** The permission mode the new agent started in (its label), when the chain made one. */
+      mode: z.string().nullable().optional(),
       from: z.string().nullable().default(null),
     })
     .nullable()

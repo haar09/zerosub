@@ -688,8 +688,8 @@ describe("adding a folder that's already signed in", () => {
 });
 
 describe("fallback chains (this fork) and accounts' folders", () => {
-  const pool = { source: "claude" as const, accountId: null, model: null, thinking: null };
-  const keyStep = (accountId: string) => ({ source: "account" as const, accountId, model: null, thinking: null });
+  const pool = { source: "claude" as const, accountId: null, model: null, thinking: null, modeId: null };
+  const keyStep = (accountId: string) => ({ source: "account" as const, accountId, model: null, thinking: null, modeId: null });
 
   it("keep a chain's API-key step, and the agents on it, when the account's folder moves", async () => {
     const { service, store } = start();

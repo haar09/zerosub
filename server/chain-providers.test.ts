@@ -16,8 +16,8 @@ const claudeSub = { id: "claude-main", family: "claude", label: "Claude", kind: 
 const codexSub = { id: "codex-main", family: "codex", label: "ChatGPT", kind: "main", home: null };
 const azure = { id: "codex-azure", family: "codex", label: "Azure", kind: "managed", home: "/tmp/a", auth: "api", provider: "azure" };
 
-const pool = (source: "claude" | "codex") => ({ source, accountId: null, model: null, thinking: null });
-const api = (accountId: string) => ({ source: "account" as const, accountId, model: null, thinking: null });
+const pool = (source: "claude" | "codex") => ({ source, accountId: null, model: null, thinking: null, modeId: null });
+const api = (accountId: string) => ({ source: "account" as const, accountId, model: null, thinking: null, modeId: null });
 
 function stateWith(chains: Chain[]): StoredState {
   return StoredStateSchema.parse({

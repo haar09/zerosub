@@ -36,19 +36,22 @@ afterEach(async () => {
 });
 
 const inFuture = (minutes = 30) => new Date(Date.now() + minutes * 60_000).toISOString();
-const pool = (source: "claude" | "codex", model: string | null = null): ChainStep => ({ source, accountId: null, model, thinking: null });
-const api = (accountId: string): ChainStep => ({ source: "account", accountId, model: null, thinking: null });
+const pool = (source: "claude" | "codex", model: string | null = null, modeId: string | null = null): ChainStep => ({ source, accountId: null, model, thinking: null, modeId });
+const api = (accountId: string): ChainStep => ({ source: "account", accountId, model: null, thinking: null, modeId: null });
 
-const MODES: Record<string, Array<{ id: string; label: string; colorTier: string }>> = {
+// As Paseo 0.9.1 lists them.
+const MODES: Record<string, Array<{ id: string; label: string; colorTier: string; icon: string }>> = {
   claude: [
-    { id: "plan", label: "Plan Mode", colorTier: "planning" },
-    { id: "default", label: "Always Ask", colorTier: "safe" },
-    { id: "acceptEdits", label: "Accept File Edits", colorTier: "moderate" },
-    { id: "bypassPermissions", label: "Bypass", colorTier: "dangerous" },
+    { id: "plan", label: "Plan Mode", colorTier: "planning", icon: "ShieldEllipsis" },
+    { id: "default", label: "Always Ask", colorTier: "safe", icon: "Shield" },
+    { id: "acceptEdits", label: "Accept File Edits", colorTier: "moderate", icon: "ShieldPlus" },
+    { id: "auto", label: "Auto mode", colorTier: "moderate", icon: "ShieldCheck" },
+    { id: "bypassPermissions", label: "Bypass", colorTier: "dangerous", icon: "ShieldOff" },
   ],
   codex: [
-    { id: "auto", label: "Default Permissions", colorTier: "moderate" },
-    { id: "full-access", label: "Full Access", colorTier: "dangerous" },
+    { id: "auto", label: "Default Permissions", colorTier: "moderate", icon: "Shield" },
+    { id: "auto-review", label: "Auto-review", colorTier: "moderate", icon: "ShieldCheck" },
+    { id: "full-access", label: "Full Access", colorTier: "dangerous", icon: "ShieldOff" },
   ],
 };
 
@@ -354,6 +357,65 @@ describe("fallback chains", () => {
     expect(notes.filter((note) => note.kind === "zerosub-link")).toHaveLength(1);
   });
 
+  it("forks an agent in Auto mode to Auto-review, not Default Permissions, and names the mode in the note", async () => {
+    const { created, rows, limitTurn } = await setUp({ steps: [pool("claude"), pool("codex")], modeId: "auto" });
+    await limitTurn();
+    expect(created[0]?.config.modeId).toBe("auto-review");
+    expect(rows().at(-1)).toMatchObject({ outcome: "continued", detail: null, chain: { step: 2, mode: "Auto-review" } });
+    const accepting = await setUp({ steps: [pool("claude"), pool("codex")], modeId: "acceptEdits" });
+    await accepting.limitTurn();
+    expect(accepting.created[0]?.config.modeId).toBe("auto");
+  });
+
+  it("forks an agent in Auto mode past a Bedrock step to the other provider, saying why it skipped Bedrock", async () => {
+    const { store, rows, created, limitTurn } = await setUp({ steps: [pool("claude"), api(BEDROCK), pool("codex")], modeId: "auto" });
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(CLAUDE);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.config.modeId).toBe("auto-review");
+    expect(rows().at(-1)).toMatchObject({ outcome: "continued", toFamily: "codex", chain: { step: 3, mode: "Auto-review" } });
+    expect(String(rows().at(-1)!.detail)).toMatch(/bed \(AWS Bedrock\) wasn't used: Bedrock can't run Claude's Auto mode/);
+  });
+
+  it("forks in the mode the step sets, even one that allows more than the original's", async () => {
+    const { created, rows, limitTurn } = await setUp({ steps: [pool("claude"), pool("codex", "gpt-6.1-sol", "full-access")], modeId: "acceptEdits" });
+    await limitTurn();
+    expect(created).toHaveLength(1);
+    expect(created[0]!.config).toEqual({ provider: "codex/gpt-6.1-sol", modeId: "full-access" });
+    expect(rows().at(-1)).toMatchObject({ outcome: "continued", detail: null, chain: { step: 2, model: "gpt-6.1-sol", mode: "Full Access" } });
+  });
+
+  it("falls back to the closest mode when the step's mode isn't one the provider has, and says so", async () => {
+    const { created, rows, limitTurn } = await setUp({ steps: [pool("claude"), pool("codex", null, "yolo")], modeId: "bypassPermissions" });
+    await limitTurn();
+    expect(created[0]?.config.modeId).toBe("full-access");
+    const row = rows().at(-1)!;
+    expect(row).toMatchObject({ outcome: "continued", chain: { mode: "Full Access" } });
+    expect(String(row.detail)).toMatch(/Step 2's permission mode “yolo” isn't one ChatGPT has here, so the new agent got “Full Access”/);
+  });
+
+  it("forks an agent in Plan Mode or Always Ask when the step sets a mode of its own", async () => {
+    const planning = await setUp({ steps: [pool("claude"), pool("codex", null, "auto")], modeId: "plan" });
+    await planning.limitTurn();
+    expect(planning.created).toHaveLength(1);
+    expect(planning.created[0]!.config.modeId).toBe("auto");
+    expect(planning.rows().at(-1)).toMatchObject({ outcome: "continued", chain: { mode: "Default Permissions" } });
+    await planning.service.stop();
+
+    // A step whose mode the provider lacks still follows the safety rule: nothing as careful, no fork.
+    const asking = await setUp({ steps: [pool("claude"), pool("codex", null, "yolo")], modeId: "default" });
+    await asking.limitTurn();
+    expect(asking.created).toHaveLength(0);
+    expect(String(asking.rows().at(-1)!.detail)).toMatch(/permission mode “yolo” isn't one ChatGPT has here, and ChatGPT has no mode as careful/);
+  });
+
+  it("tries a later step of the other provider that sets a mode after one that couldn't take the agent", async () => {
+    const { created, limitTurn } = await setUp({ steps: [pool("claude"), pool("codex"), pool("codex", "gpt-6.1-sol", "auto-review")], modeId: "plan" });
+    await limitTurn();
+    expect(created).toHaveLength(1);
+    expect(created[0]!.config).toEqual({ provider: "codex/gpt-6.1-sol", modeId: "auto-review" });
+  });
+
   it("starts the fork on the provider's default model when the step names none", async () => {
     const { created, limitTurn } = await setUp({ steps: [pool("claude"), pool("codex")] });
     await limitTurn();
@@ -464,6 +526,23 @@ describe("fallback chains", () => {
     await limitTurn();
     expect(created).toHaveLength(1);
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(CLAUDE);
+  });
+
+  it("lists each provider's permission modes, and saves a step's mode only when its provider has it", async () => {
+    const { service, store, paseo } = await setUp({ steps: [pool("claude")] });
+    const modes = await service.chainModes(paseo as never);
+    expect(modes.codex?.map((mode) => [mode.id, mode.label, mode.colorTier])).toEqual([
+      ["auto", "Default Permissions", "moderate"],
+      ["auto-review", "Auto-review", "moderate"],
+      ["full-access", "Full Access", "dangerous"],
+    ]);
+    expect(modes.claude?.map((mode) => mode.id)).toEqual(["plan", "default", "acceptEdits", "auto", "bypassPermissions"]);
+
+    const { id } = await service.saveChain({ name: "Moded", steps: [pool("claude"), { ...pool("codex"), modeId: " full-access " }] }, paseo as never);
+    expect((await store.read()).chains.find((chain) => chain.id === id)?.steps.map((step) => step.modeId)).toEqual([null, "full-access"]);
+    await expect(service.saveChain({ name: "Odd", steps: [{ ...pool("codex"), modeId: "bypassPermissions" }] }, paseo as never)).rejects.toThrow(
+      /Step 1: ChatGPT has no permission mode “bypassPermissions”/,
+    );
   });
 
   it("sets, follows and turns off an agent's chain", async () => {

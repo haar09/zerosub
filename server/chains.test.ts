@@ -20,8 +20,8 @@ const azure = { id: "codex-azure", family: "codex", label: "Azure", auth: "api",
 /** A Claude API-key account (upstream #65): no provider marker. */
 const claudeKey = { id: "claude-key", family: "claude", label: "Key", auth: "api" };
 
-const pool = (source: "claude" | "codex") => ({ source, accountId: null, model: null, thinking: null });
-const api = (accountId: string) => ({ source: "account" as const, accountId, model: null, thinking: null });
+const pool = (source: "claude" | "codex") => ({ source, accountId: null, model: null, thinking: null, modeId: null });
+const api = (accountId: string) => ({ source: "account" as const, accountId, model: null, thinking: null, modeId: null });
 const chain = (steps: Chain["steps"]): Chain => ({ id: "c", name: "Work", steps, auto: false });
 
 describe("seeding the default chain", () => {
@@ -132,6 +132,42 @@ describe("where an agent is in its chain", () => {
     expect(stepOf(state, chain([pool("claude")]), state.accounts[1]!)).toBeNull();
     // A Codex API account without the Azure marker isn't one.
     expect(chainProblem(state, { id: "y", name: "Odd", steps: [api("codex-key")] })).toMatch(/Step 1: pick/);
+  });
+
+  it("checks a step's permission mode against its provider's modes, when they're known", () => {
+    const state = stateWith([claudeSub, codexSub, bedrock, azure]);
+    const modes = {
+      claude: [{ id: "auto", label: "Auto mode", colorTier: "moderate" }],
+      codex: [{ id: "full-access", label: "Full Access", colorTier: "dangerous" }],
+    };
+    const moded = [{ ...pool("claude"), modeId: "auto" }, { ...api("codex-azure"), modeId: "full-access" }];
+    expect(chainProblem(state, { id: "x", name: "Moded", steps: moded }, modes)).toBeNull();
+    // A Claude mode on a ChatGPT step isn't one.
+    expect(chainProblem(state, { id: "x", name: "Moded", steps: [{ ...pool("codex"), modeId: "auto" }] }, modes)).toMatch(
+      /Step 1: ChatGPT has no permission mode “auto”/,
+    );
+    // Unknown modes (the daemon couldn't list them) aren't checked; the fork falls back at run time.
+    expect(chainProblem(state, { id: "x", name: "Moded", steps: [{ ...pool("codex"), modeId: "auto" }] }, { claude: null, codex: null })).toBeNull();
+    expect(chainProblem(state, { id: "x", name: "Moded", steps: [{ ...pool("codex"), modeId: "auto" }] })).toBeNull();
+    // The same source with another mode is another step.
+    expect(chainProblem(state, { id: "x", name: "Two", steps: [pool("codex"), { ...pool("codex"), modeId: "full-access" }] }, modes)).toBeNull();
+    expect(chainProblem(state, { id: "x", name: "Two", steps: [pool("codex"), pool("codex")] }, modes)).toMatch(/repeats an earlier step/);
+  });
+
+  it("refuses Claude's Auto mode on a Bedrock step, which Bedrock can't run, but not on a Claude API key or the subscriptions", () => {
+    const state = stateWith([claudeSub, codexSub, bedrock, claudeKey]);
+    const modes = { claude: [{ id: "auto", label: "Auto mode", colorTier: "moderate" }, { id: "acceptEdits", label: "Accept File Edits", colorTier: "moderate" }], codex: null };
+    expect(chainProblem(state, { id: "x", name: "Bed", steps: [pool("claude"), { ...api("claude-bedrock"), modeId: "auto" }] }, modes)).toMatch(
+      /Step 2: AWS Bedrock can't run Claude's Auto mode/,
+    );
+    // Even when the daemon couldn't list the modes.
+    expect(chainProblem(state, { id: "x", name: "Bed", steps: [{ ...api("claude-bedrock"), modeId: "auto" }] })).toMatch(/Step 1: AWS Bedrock/);
+    expect(chainProblem(state, { id: "x", name: "Bed", steps: [{ ...api("claude-bedrock"), modeId: "acceptEdits" }] }, modes)).toBeNull();
+    expect(chainProblem(state, { id: "x", name: "Key", steps: [{ ...pool("claude"), modeId: "auto" }, { ...api("claude-key"), modeId: "auto" }] }, modes)).toBeNull();
+  });
+
+  it("seeds steps without a permission mode", () => {
+    expect(seededSteps(stateWith([claudeSub, codexSub, azure])).every((step) => step.modeId === null)).toBe(true);
   });
 
   it("says when the earliest step frees up", () => {

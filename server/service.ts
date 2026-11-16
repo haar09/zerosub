@@ -38,7 +38,7 @@ import { capsAccount, limitedPick } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
 import type { RedeemResult, ReopenSummary } from "../shared/rpc";
 import { LINK_ROW_KIND, LINK_ROW_VERSION, SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type LinkRow, type SwitchRow } from "../shared/timeline";
-import type { AgentChainView, Chain, ChainStep } from "../shared/chains";
+import type { AgentChainView, Chain, ChainMode, ChainModes, ChainStep } from "../shared/chains";
 import {
   chainOf,
   chainProblem,
@@ -55,6 +55,7 @@ import {
   stepFamily,
   stepLabel,
   stepOf,
+  type ChainFamily,
 } from "./chains";
 import {
   applyEnv,
@@ -108,7 +109,7 @@ import { PI_ACCOUNT_FILE, codexSessionsShared, prepareClaudeHome, crossesInherit
 import { Mutex } from "./json-file";
 import { detectAzureLimit, detectAzureSignOut, detectBedrockAutoModeRefusal, detectBedrockLimit, detectBedrockModelUnavailable, detectBedrockRefusal, turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
-import { equivalentMode, withinMode } from "./modes";
+import { equivalentMode, withinMode, type ModeInfo } from "./modes";
 import { homesDir, inHomesDir, isOwnHome, shownPath } from "./paths";
 import { chooseHomesDir, chooseImportedHome, chooseImportedPiHome, homesDirFor, PLACED, placeFor, type PlacedFamily } from "./placement";
 import { maskProxy, normalizeProxy } from "./proxy";
@@ -282,6 +283,9 @@ type ForkOutcome =
       account?: StoredAccount;
       /** A fork to the other provider: false for a new agent, which is linked to its source (see `linkContinuation`). */
       reused?: boolean;
+      /** A new fork to the other provider: its mode's label, and why it isn't the one a chain step set. */
+      modeLabel?: string;
+      modeNote?: string;
     }
   /**
    * `mode`: the other provider has no mode careful enough (a chain skips its other steps of that
@@ -2184,9 +2188,9 @@ export class Service {
   }
 
   /** The chain's details for a timeline note about moving to step `index`. */
-  private chainNote(state: StoredState, chain: Chain, index: number, from: string | null, model: string | null = null): NonNullable<SwitchRow["chain"]> {
+  private chainNote(state: StoredState, chain: Chain, index: number, from: string | null, model: string | null = null, mode: string | null = null): NonNullable<SwitchRow["chain"]> {
     const step = chain.steps[index]!;
-    return { name: chain.name, step: index + 1, steps: chain.steps.length, label: stepLabel(state, step), model: model ?? step.model ?? null, from };
+    return { name: chain.name, step: index + 1, steps: chain.steps.length, label: stepLabel(state, step), model: model ?? step.model ?? null, ...(mode ? { mode } : {}), from };
   }
 
   /** Moves an agent's chain record to `step` (as the furthest step reached), unless it changed meanwhile. */
@@ -2261,7 +2265,7 @@ export class Service {
       }
       if (!stepAvailable(state, step, now)) continue;
       const target = stepFamily(state, step)!;
-      const note = (model: string | null = null) => this.chainNote(state, chain, index, from, model);
+      const note = (model: string | null = null, mode: string | null = null) => this.chainNote(state, chain, index, from, model, mode);
       if (target === family) {
         // Bedrock can't run Claude's Auto mode (see `paidFor`): an agent in it skips a Bedrock step.
         const stepOn = step.source === "account" ? stepAccount(state, step) : undefined;
@@ -2293,18 +2297,30 @@ export class Service {
         const next = step.source === "account" ? stepAccount(state, step) : mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([account.id]), false);
         if (!next || !HAND_OFF[family] || !this.prefs.autoContinue) continue;
         try {
-          const continuation = await this.continueElsewhere(paseo, agentId, next, `its fallback chain “${chain.name}” moved on: ${from.toLowerCase()}`, timeline, "auto");
+          // The step's permission mode, when it sets one this provider has; otherwise the tab keeps the source's.
+          const stepMode = await this.stepMode(paseo, agentId, step, index);
+          const continuation = await this.continueElsewhere(paseo, agentId, next, `its fallback chain “${chain.name}” moved on: ${from.toLowerCase()}`, timeline, "auto", stepMode.modeId);
           this.switchGuard.note(agentId, now);
           await this.store.update((draft) => this.inheritChain(draft, agentId, continuation.agentId, index));
           await this.linkContinuation(paseo, agentId, continuation);
-          await this.appendRow(paseo, agentId, { ...base, to: next.label, reason, continued: true, continuedIn: continuation, outcome: "continued", detail: joinDetails(...autoSkips), chain: note() });
+          await this.appendRow(paseo, agentId, {
+            ...base,
+            to: next.label,
+            reason,
+            continued: true,
+            continuedIn: continuation,
+            outcome: "continued",
+            detail: joinDetails(...autoSkips, stepMode.note),
+            chain: note(null, stepMode.label),
+          });
           return;
         } catch (error) {
           skipped.push(`Couldn't continue on ${next.label}: ${describe(error)}`);
           continue;
         }
       }
-      if (crossBlocked) continue;
+      // An agent whose mode the other provider can't match isn't forked there, unless the step sets a mode itself.
+      if (crossBlocked && !step.modeId) continue;
       const result = await this.forkToOtherProvider(paseo, agentId, family, timeline, "auto", { chain, index }).catch((error: unknown) => ({
         skipped: `Couldn't continue on ${FAMILY_LABEL[target]}: ${describe(error)}`,
         mode: false,
@@ -2320,12 +2336,12 @@ export class Service {
           continued: true,
           continuedIn: result.fork,
           outcome: "continued",
-          detail: joinDetails(...autoSkips),
-          chain: note(result.fork.model ?? null),
+          detail: joinDetails(...autoSkips, result.modeNote ?? null),
+          chain: note(result.fork.model ?? null, result.modeLabel ?? null),
         });
         return;
       }
-      if ("mode" in result && result.mode) crossBlocked = true;
+      if ("mode" in result && result.mode && !step.modeId) crossBlocked = true;
       if ("autoMode" in result && result.autoMode) autoSkips.push(result.skipped);
       skipped.push(result.skipped);
     }
@@ -2366,9 +2382,54 @@ export class Service {
     };
   }
 
+  /** Each chain family's permission modes, as its Paseo provider lists them; null for one it couldn't list. */
+  async chainModes(paseo: PaseoApi): Promise<ChainModes> {
+    let families: Record<string, Family>;
+    try {
+      families = await this.families.resolve(paseo);
+    } catch {
+      return { claude: null, codex: null };
+    }
+    const list = async (family: ChainFamily): Promise<ChainMode[] | null> => {
+      const provider = familyProvider(families, family);
+      if (!provider) return null;
+      try {
+        const result = await paseo.providers.listModes(provider);
+        if (!result.modes || result.modes.length === 0) return null;
+        return result.modes.map((mode) => ({ id: mode.id, label: mode.label || mode.id, colorTier: mode.colorTier ?? null }));
+      } catch {
+        return null;
+      }
+    };
+    const [claude, codex] = await Promise.all([list("claude"), list("codex")]);
+    return { claude, codex };
+  }
+
+  /**
+   * The permission mode a chain step names for a new tab of the agent's own provider: its ID and label
+   * when the provider has it; when it doesn't, none (the tab keeps the source's mode) and a note saying so.
+   */
+  private async stepMode(paseo: PaseoApi, agentId: string, step: ChainStep, index: number): Promise<{ modeId: string | null; label: string | null; note: string | null }> {
+    if (!step.modeId) return { modeId: null, label: null, note: null };
+    let modes: ModeInfo[] = [];
+    try {
+      const info = await lookUpAgent(paseo, agentId);
+      if (info) modes = await modesOf(paseo, info.provider, await this.families.resolve(paseo));
+    } catch {
+      // Unknown modes: the tab keeps the source's mode, and the note says so.
+    }
+    const mode = modes.find((entry) => entry.id === step.modeId);
+    if (mode) return { modeId: mode.id, label: mode.label || mode.id, note: null };
+    return { modeId: null, label: null, note: `Step ${index + 1}'s permission mode “${step.modeId}” isn't one this provider has here, so the new tab keeps this agent's mode.` };
+  }
+
   async saveChain(input: { id?: string; name: string; steps: ChainStep[]; picker?: boolean }, paseo?: PaseoApi): Promise<{ id: string }> {
     const id = input.id ?? newChainId();
     let problem: string | null = null;
+    const connection = paseo ?? this.paseo;
+    // A step's mode is checked against its provider's modes when they can be listed; at run time a
+    // mode the provider no longer has falls back to the original agent's (see `forkToOtherProvider`).
+    const modes = connection && input.steps.some((step) => step.modeId?.trim()) ? await this.chainModes(connection) : undefined;
     await this.store.update((draft) => {
       const existing = draft.chains.find((chain) => chain.id === id);
       if (input.id && !existing) {
@@ -2379,11 +2440,17 @@ export class Service {
       const chain: Chain = {
         id,
         name: input.name.trim(),
-        steps: input.steps.map((step) => ({ ...step, accountId: step.source === "account" ? step.accountId : null, model: step.model?.trim() || null, thinking: step.thinking?.trim() || null })),
+        steps: input.steps.map((step) => ({
+          ...step,
+          accountId: step.source === "account" ? step.accountId : null,
+          model: step.model?.trim() || null,
+          thinking: step.thinking?.trim() || null,
+          modeId: step.modeId?.trim() || null,
+        })),
         auto: false,
         ...(picker === false ? { picker: false } : {}),
       };
-      problem = chainProblem(draft, chain);
+      problem = chainProblem(draft, chain, modes);
       if (problem) return;
       if (existing) {
         Object.assign(existing, chain);
@@ -2395,7 +2462,6 @@ export class Service {
     });
     if (problem) throw new Error(problem);
     console.log(`[ZeroSub] saved chain ${input.name}`);
-    const connection = paseo ?? this.paseo;
     if (connection) await this.syncChainProviders(connection);
     return { id };
   }
@@ -2518,7 +2584,8 @@ export class Service {
   /**
    * Carries an agent's work on in a new agent on the other provider (Claude ↔ ChatGPT), for when
    * every account of its own provider is out. The new agent gets the conversation so far and a mode
-   * no more permissive than the original's; the original stays as it was.
+   * no more permissive than the original's, or the mode the chain's step names (the user chose it
+   * there, so it may allow more); the original stays as it was.
    */
   private async forkToOtherProvider(
     paseo: PaseoApi,
@@ -2568,7 +2635,7 @@ export class Service {
     if (this.availability.get(other)?.ok === false) return { skipped: `${PROVIDER_NAME[other]} isn't installed where the daemon runs.` };
     // The built-in provider, or a profile of the user's that runs it; never a chain's provider entry,
     // whose own chain would be bound to the fork (the fork follows this agent's chain, set below).
-    const provider = families[other] === other ? other : Object.keys(families).find((id) => families[id] === other && !isChainProviderId(id));
+    const provider = familyProvider(families, other);
     const available = provider
       ? (await paseo.providers.listAvailable()).providers?.some((entry) => entry.provider === provider && entry.available)
       : false;
@@ -2595,15 +2662,16 @@ export class Service {
 
     const original = (await paseo.agents.ref(agentId).refresh())?.agent;
     if (!original) throw new Error("That agent is no longer available.");
-    const [sourceModes, targetModes] = await Promise.all([
-      paseo.providers.listModes(original.provider).then((result) => result.modes ?? []),
-      paseo.providers.listModes(provider).then((result) => result.modes ?? []),
-    ]);
-    const modeId = equivalentMode(sourceModes, original.currentModeId, targetModes);
+    const [sourceModes, targetModes] = await Promise.all([modesOf(paseo, original.provider, families), modesOf(paseo, provider, families)]);
+    // A step's own mode is the user's choice for it, so it may allow more than the original's. Without
+    // one (or with one the provider doesn't have), the fork never gets more freedom than the original.
+    const chosen = step?.modeId ? targetModes.find((mode) => mode.id === step.modeId) : undefined;
+    const modeId = chosen?.id ?? equivalentMode(sourceModes, original.currentModeId, targetModes);
+    const missing = step?.modeId && !chosen ? `Step ${chainTarget!.index + 1}'s permission mode “${step.modeId}” isn't one ${name} has here` : null;
     if (!modeId) {
       const current = sourceModes.find((mode) => mode.id === original.currentModeId)?.label;
       return {
-        skipped: `${name} has no mode as careful as this agent's${current ? ` (“${current}”)` : ""}, so ZeroSub didn't continue it there.`,
+        skipped: `${missing ? `${missing}, and ` : ""}${name} has no mode as careful as this agent's${current ? ` (“${current}”)` : ""}, so ZeroSub didn't continue it there.`,
         mode: true,
       };
     }
@@ -2614,6 +2682,8 @@ export class Service {
       if (!subscription) return { skipped: autoModeSkipNote(account.label), autoMode: true };
       account = subscription;
     }
+    const label = targetModes.find((mode) => mode.id === modeId)?.label ?? modeId;
+    const modeNote = missing ? `${missing}, so the new agent got “${label}”, the closest to this agent's mode that allows no more.` : undefined;
 
     // Every check that can refuse has passed, so the stale reservation goes now.
     if (reservation) {
@@ -2642,7 +2712,7 @@ export class Service {
         });
       },
     });
-    console.log(`[ZeroSub] ${agentId} continues on ${name} (${account.label}) in ${fork.agentId}`);
+    console.log(`[ZeroSub] ${agentId} continues on ${name} (${account.label}, ${modeId}) in ${fork.agentId}`);
     return {
       fork: { ...fork, workspaceId: original.workspaceId ?? null },
       to: account.label,
@@ -2651,6 +2721,8 @@ export class Service {
       delivery: "sent",
       account,
       reused: false,
+      modeLabel: label,
+      ...(modeNote ? { modeNote } : {}),
       ...(isLastResort(account) ? { detail: paidFallbackNote(account) } : {}),
     };
   }
@@ -3285,7 +3357,7 @@ export class Service {
       toProvider: result.toProvider,
       outcome: result.delivery === "sent" ? "continued" : "stayed",
       delivery: result.delivery,
-      detail: result.detail ?? null,
+      detail: joinDetails(result.detail ?? null, result.modeNote ?? null),
       at: new Date().toISOString(),
     });
     return { ...result.fork, delivery: result.delivery };
@@ -3473,8 +3545,10 @@ export class Service {
     why: string,
     timeline: readonly AgentTimelineItem[] | undefined,
     source: "auto" | "user",
+    /** The new ChatGPT tab's permission mode (a chain step's); the source agent's when absent. */
+    modeId?: string | null,
   ): Promise<Continuation> {
-    if (target.family === "codex") return this.continuations.continue(paseo, agentId, target, why, source);
+    if (target.family === "codex") return this.continuations.continue(paseo, agentId, target, why, source, modeId ?? undefined);
     return continueInNewAgent({
       paseo,
       sourceAgentId: agentId,
@@ -6093,4 +6167,20 @@ function log(message: string, error: unknown): void {
 
 export function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The Paseo provider that runs `family`'s agents: the built-in one, or a profile of the user's that runs it; never a chain's provider entry. */
+function familyProvider(families: Record<string, Family>, family: Family): string | undefined {
+  return families[family] === family ? family : Object.keys(families).find((id) => families[id] === family && !isChainProviderId(id));
+}
+
+/**
+ * A provider's permission modes. A profile or a chain's provider entry that lists none (it `extends`
+ * a built-in provider, whose modes it runs with) gets its family's built-in provider's.
+ */
+async function modesOf(paseo: PaseoApi, provider: string, families: Record<string, Family>): Promise<ModeInfo[]> {
+  const modes = (await paseo.providers.listModes(provider)).modes ?? [];
+  const family = families[provider];
+  if (modes.length > 0 || !family || family === provider || families[family] !== family) return modes;
+  return (await paseo.providers.listModes(family)).modes ?? [];
 }

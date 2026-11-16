@@ -1,11 +1,12 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Modal, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
 import { SettingsCard, SettingsSwitch } from "@getpaseo/plugin/client/ui";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Text, View } from "react-native";
-import { MAX_CHAIN_STEPS, POOL_LABEL, type ChainStep, type ChainView } from "../shared/chains";
+import { MAX_CHAIN_STEPS, POOL_LABEL, type ChainModes, type ChainStep, type ChainView } from "../shared/chains";
 import type { StateView } from "../shared/model";
-import { deleteChain, saveChain, setDefaultChain } from "../shared/rpc";
+import { deleteChain, listChainModes, saveChain, setDefaultChain } from "../shared/rpc";
+import { editorStepFamily, editorStepOnBedrock, editorSteps, modeChoices, newStep, stepModeLabel, withSource } from "./chain-modes";
 import { useInputStyle } from "./pi-accounts";
 import { describe, type ZeroSubStore } from "./store";
 import { Badge, Button, Card, IconButton, useText } from "./ui";
@@ -38,9 +39,10 @@ function sourceOptions(state: StateView): SourceOption[] {
 
 const keyOf = (step: Pick<ChainStep, "source" | "accountId">) => (step.source === "account" ? (step.accountId ?? "") : step.source);
 
-/** One line per step: "2. ChatGPT subscription · gpt-5.5 · thinking high". */
-export function stepLine(step: ChainView["steps"][number], index: number): string {
-  const extras = [step.model, step.thinking ? `thinking ${step.thinking}` : null].filter(Boolean).join(" · ");
+/** One line per step: "2. ChatGPT subscription · gpt-5.5 · thinking high · Full Access". */
+export function stepLine(step: ChainView["steps"][number], index: number, modes?: ChainModes | null): string {
+  const mode = step.modeId ? stepModeLabel(modes, step.family, step.modeId) : null;
+  const extras = [step.model, step.thinking ? `thinking ${step.thinking}` : null, mode].filter(Boolean).join(" · ");
   return `${index + 1}. ${step.label}${extras ? ` · ${extras}` : ""}`;
 }
 
@@ -56,6 +58,7 @@ export function pickerLine(chain: ChainView): string | null {
 export function ChainsSection({ theme, state, store, compact }: { theme: Theme; state: StateView; store: ZeroSubStore; compact: boolean }) {
   const text = useText(theme);
   const [editing, setEditing] = useState<ChainView | "new" | null>(null);
+  const modes = useChainModes(store, editing !== null);
   const chains = state.chains;
   if (!chains) return null;
   return (
@@ -92,16 +95,37 @@ export function ChainsSection({ theme, state, store, compact }: { theme: Theme; 
       ) : null}
       {chains.length === 0 ? <Text style={text.muted}>No chains. Agents switch accounts as without chains.</Text> : null}
       {chains.map((chain) => (
-        <ChainCard key={chain.id} theme={theme} chain={chain} store={store} onEdit={() => setEditing(chain)} />
+        <ChainCard key={chain.id} theme={theme} chain={chain} modes={modes} store={store} onEdit={() => setEditing(chain)} />
       ))}
       {editing ? (
-        <ChainEditor theme={theme} state={state} store={store} chain={editing === "new" ? null : editing} onClose={() => setEditing(null)} />
+        <ChainEditor theme={theme} state={state} store={store} modes={modes} chain={editing === "new" ? null : editing} onClose={() => setEditing(null)} />
       ) : null}
     </View>
   );
 }
 
-function ChainCard({ theme, chain, store, onEdit }: { theme: Theme; chain: ChainView; store: ZeroSubStore; onEdit(): void }) {
+/**
+ * Each provider's permission modes, from the daemon: asked for once, and again each time the editor
+ * opens (so a provider that was still starting shows up). Null until they arrive, or when they can't be.
+ */
+function useChainModes(store: ZeroSubStore, editing: boolean): ChainModes | null {
+  const [modes, setModes] = useState<ChainModes | null>(null);
+  useEffect(() => {
+    let live = true;
+    store.rpc(listChainModes, {}).then(
+      (result) => {
+        if (live) setModes(result);
+      },
+      () => undefined,
+    );
+    return () => {
+      live = false;
+    };
+  }, [store, editing]);
+  return modes;
+}
+
+function ChainCard({ theme, chain, modes, store, onEdit }: { theme: Theme; chain: ChainView; modes: ChainModes | null; store: ZeroSubStore; onEdit(): void }) {
   const text = useText(theme);
   const toast = useToast();
   const [busy, setBusy] = useState<"default" | "delete" | null>(null);
@@ -132,7 +156,7 @@ function ChainCard({ theme, chain, store, onEdit }: { theme: Theme; chain: Chain
       <View style={{ gap: 4 }}>
         {chain.steps.map((step, index) => (
           <Text key={`${index}-${keyOf(step)}`} style={step.status === "broken" ? text.danger : text.body}>
-            {stepLine(step, index)}
+            {stepLine(step, index, modes)}
             {step.status === "broken" ? " — account removed, skipped" : step.status === "exhausted" ? " — out for now" : ""}
           </Text>
         ))}
@@ -171,15 +195,27 @@ function ChainCard({ theme, chain, store, onEdit }: { theme: Theme; chain: Chain
   );
 }
 
-function ChainEditor({ theme, state, store, chain, onClose }: { theme: Theme; state: StateView; store: ZeroSubStore; chain: ChainView | null; onClose(): void }) {
+function ChainEditor({
+  theme,
+  state,
+  store,
+  modes,
+  chain,
+  onClose,
+}: {
+  theme: Theme;
+  state: StateView;
+  store: ZeroSubStore;
+  modes: ChainModes | null;
+  chain: ChainView | null;
+  onClose(): void;
+}) {
   const text = useText(theme);
   const toast = useToast();
   const inputStyle = useInputStyle(theme);
   const options = sourceOptions(state);
   const [name, setName] = useState(chain?.name ?? "");
-  const [steps, setSteps] = useState<ChainStep[]>(() =>
-    chain ? chain.steps.map(({ source, accountId, model, thinking }) => ({ source, accountId, model, thinking })) : [{ source: "claude", accountId: null, model: null, thinking: null }],
-  );
+  const [steps, setSteps] = useState<ChainStep[]>(() => editorSteps(chain));
   const [picker, setPicker] = useState(chain?.picker !== false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -240,11 +276,19 @@ function ChainEditor({ theme, state, store, chain, onClose }: { theme: Theme; st
                       size="small"
                       tone={option.key === keyOf(step) ? "primary" : "secondary"}
                       label={option.label}
-                      onPress={() => change(index, option.step)}
+                      onPress={() => setSteps(steps.map((entry, at) => (at === index ? withSource(entry, option.step, state.accounts) : entry)))}
                     />
                   ))}
                 </View>
                 {!known ? <Text style={text.danger}>Its account was removed: pick another source, or remove the step.</Text> : null}
+                <StepModePicker
+                  theme={theme}
+                  step={step}
+                  index={index}
+                  modes={modes}
+                  family={editorStepFamily(step, state.accounts)}
+                  bedrock={editorStepOnBedrock(step, state.accounts)}
+                  onChange={(modeId) => change(index, { modeId })} />
                 <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
                   <TextInput
                     value={step.model ?? ""}
@@ -281,12 +325,12 @@ function ChainEditor({ theme, state, store, chain, onClose }: { theme: Theme; st
               tooltip="Add a step at the end"
               tooltipAlign="start"
               disabled={steps.length >= MAX_CHAIN_STEPS}
-              onPress={() => setSteps([...steps, { source: "codex", accountId: null, model: null, thinking: null }])}
+              onPress={() => setSteps([...steps, newStep()])}
             />
           </View>
           <Text style={text.small}>
-            Model and thinking apply when the chain starts a new agent for the step (a fork to the other provider); empty uses that provider's
-            default. An agent moved in place keeps its model.
+            Model, thinking and permissions apply when the chain starts a new agent for the step (a fork to the other provider, or a new
+            ChatGPT tab); empty uses that provider's default. An agent moved in place keeps its model and permission mode.
           </Text>
           <SettingsCard>
             <SettingsSwitch
@@ -317,5 +361,85 @@ function ChainEditor({ theme, state, store, chain, onClose }: { theme: Theme; st
         </View>
       </Modal.Content>
     </Modal>
+  );
+}
+
+/**
+ * A step's permission mode: "match the original" (the original agent's own mode, or across providers
+ * the closest one that allows no more; a fork is skipped when there's none, e.g. from Plan Mode), or
+ * one of the step's provider's modes, which the new agent then starts in even when it allows more.
+ */
+function StepModePicker({
+  theme,
+  step,
+  index,
+  modes,
+  family,
+  bedrock,
+  onChange,
+}: {
+  theme: Theme;
+  step: ChainStep;
+  index: number;
+  modes: ChainModes | null;
+  family: "claude" | "codex" | null;
+  /** The step is an AWS Bedrock account, which can't run Claude's Auto mode. */
+  bedrock: boolean;
+  onChange(modeId: string | null): void;
+}) {
+  const text = useText(theme);
+  if (!family) return null;
+  const listed = modes?.[family] ?? null;
+  const choices = modeChoices(listed, step.modeId, bedrock);
+  const selected = choices.find((choice) => choice.id === (step.modeId ?? null));
+  return (
+    <View style={{ gap: 6 }}>
+      <Text style={text.strong}>Permissions on {family === "claude" ? "Claude" : "ChatGPT"}</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+        {choices.map((choice) => (
+          <Button
+            key={choice.id ?? ""}
+            theme={theme}
+            size="small"
+            tone={choice.id === (step.modeId ?? null) ? "primary" : choice.dangerous ? "danger" : "secondary"}
+            label={choice.dangerous ? `${choice.label} (no prompts)` : choice.label}
+            accessibilityLabel={`Step ${index + 1} permissions: ${choice.label}`}
+            tooltip={
+              choice.id === null
+                ? "The new agent gets the original agent's mode, or on the other provider the closest one that allows no more"
+                : choice.dangerous
+                  ? "The new agent runs without asking for permission"
+                  : undefined
+            }
+            tooltipAlign="start"
+            onPress={() => onChange(choice.id)}
+          />
+        ))}
+      </View>
+      {index === 0 ? (
+        <Text style={text.small}>
+          Agents started on this chain begin in the mode picked when starting them (or their Agent profile's); this one applies when a new
+          agent is made for step 1, e.g. by “Continue on …”.
+        </Text>
+      ) : null}
+      {listed === null ? (
+        <Text style={text.small}>{modes ? "Couldn't list this provider's modes" : "Loading this provider's modes…"}</Text>
+      ) : null}
+      {selected?.unsupported ? (
+        <Text style={text.danger}>AWS Bedrock can't run Claude's Auto mode. Pick another mode for this step.</Text>
+      ) : selected?.missing ? (
+        <Text style={text.danger}>This provider doesn't list “{step.modeId}”. Pick one of its modes.</Text>
+      ) : null}
+      {bedrock ? (
+        <Text style={text.small}>
+          AWS Bedrock can't run Claude's Auto mode, so it isn't offered here, and an agent in Auto mode skips this step for the next one.
+        </Text>
+      ) : null}
+      {selected?.dangerous ? (
+        <Text style={text.warning}>Warning: agents this step starts never ask for permission, even if the original agent did.</Text>
+      ) : step.modeId && !selected?.missing && !selected?.unsupported ? (
+        <Text style={text.small}>Agents this step starts use this mode, whatever the original agent's was.</Text>
+      ) : null}
+    </View>
   );
 }
