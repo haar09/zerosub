@@ -1432,10 +1432,20 @@ export class Service {
       }
       return;
     }
-    const move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
-    // Another subscription account comes first, then a banked reset (free), and a paid Azure account
-    // (with `paidApiFallback` on) only once neither is to be had.
+    let move = adapter.portable ? this.nextAccount(latest, agentId, family, account.id) : null;
+    // Another subscription account comes first, then a banked reset (free: this account's own, then
+    // one banked on another subscription account), and a paid stand-in such as Azure (with
+    // `paidApiFallback` on) only once none of those is to be had.
     let next = adapter.portable ? move?.account : mostAvailable(latest, family, (id) => this.usage.get(id), now, new Set([account.id]));
+    // A paid stand-in picked by routing waits until no reset could be spent.
+    let paidMove: { account: StoredAccount; pin: boolean } | null = null;
+    if (next && isLastResort(next)) {
+      paidMove = move ?? { account: next, pin: true };
+      next = undefined;
+      move = null;
+    }
+    let resetDetail: string | null = null;
+    let resetSpent = false;
     if (!next) {
       if (problem.kind === "limit" && problem.hit.kind === "window" && this.prefs.autoRedeem && !account.disabled && account.auth !== "api") {
         // Opt-in: every subscription account is out, so spend a banked reset rather than stop (or pay).
@@ -1465,7 +1475,21 @@ export class Service {
         }
         console.log(`[ZeroSub] no automatic reset for ${account.label}: ${reply.message}`);
       }
-      if (!adapter.portable && this.prefs.paidApiFallback) {
+      if (this.prefs.autoRedeem) {
+        // Opt-in: another subscription account has a reset banked, so spend it there and move the
+        // agent onto it, as onto any account with room, rather than stop or pay.
+        const banked = await this.redeemElsewhere(family, account.id);
+        if (banked) {
+          next = banked.account;
+          move = { account: banked.account, pin: true };
+          resetDetail = banked.detail;
+          resetSpent = banked.spent;
+        }
+      }
+      if (!next && paidMove) {
+        next = paidMove.account;
+        move = paidMove;
+      } else if (!next && !adapter.portable && this.prefs.paidApiFallback) {
         next = mostAvailable(await this.store.read(), family, (id) => this.usage.get(id), Date.now(), new Set([account.id]), true);
       }
     }
@@ -1508,7 +1532,7 @@ export class Service {
       return;
     }
 
-    if (!adapter.portable && (await this.keptSameConversation(paseo, agentId, account, next, problem, base, reason, endedAt))) return;
+    if (!adapter.portable && (await this.keptSameConversation(paseo, agentId, account, next, problem, { ...base, detail: resetDetail }, reason, endedAt))) return;
 
     if (adapter.portable) {
       if (move?.pin) await this.pin(agentId, next.id, latest.bindings[agentId]);
@@ -1522,7 +1546,7 @@ export class Service {
           reason,
           continued,
           outcome: result.outcome === "reopened" ? "switched" : "pending",
-          detail: result.outcome === "failed" ? failureDetail(result) : null,
+          detail: result.outcome === "failed" ? failureDetail(result) : resetDetail,
         },
         agentId,
       );
@@ -1538,7 +1562,7 @@ export class Service {
         to: next.label,
         reason,
         outcome: "stayed",
-        detail: `New ${FAMILY_LABEL[family]} agents will use ${next.label}.`,
+        detail: `${resetDetail ? `${resetDetail} ` : ""}New ${FAMILY_LABEL[family]} agents will use ${next.label}.`,
       });
       return;
     }
@@ -1547,6 +1571,7 @@ export class Service {
       (reason === "limit"
         ? `its ChatGPT account (${account.label}) reached its usage limit`
         : `its ChatGPT account (${account.label}) was signed out`) +
+      (resetDetail ? ` and no other ChatGPT account had room, so it moved to ${next.label}${resetSpent ? " after using a reset banked there" : ", which had room again"}` : "") +
       (paid ? ` and every other ChatGPT account is out too, so it moved to Azure OpenAI (${next.label}, a paid API billed per token)` : "");
     try {
       const continuation = await this.continueElsewhere(paseo, agentId, next, why, timeline, "auto");
@@ -1558,7 +1583,7 @@ export class Service {
         continued: true,
         continuedIn: continuation,
         outcome: "continued",
-        detail: paid ? azureFallbackNote(next.label) : null,
+        detail: paid ? azureFallbackNote(next.label) : resetDetail,
       });
     } catch (error) {
       log(`could not continue ${agentId} on ${next.label}`, error);
@@ -1569,6 +1594,28 @@ export class Service {
         outcome: "stayed",
         detail: `Couldn't continue on ${next.label}: ${describe(error)}`,
       });
+    }
+  }
+
+  /**
+   * Spends a banked reset on another subscription account of `family` at a window limit (see
+   * `withBankedReset`), trying each such account once. Returns the one that has room now, or nothing
+   * when no reset could be spent anywhere.
+   */
+  private async redeemElsewhere(family: Family, exhausted: string): Promise<{ account: StoredAccount; spent: boolean; detail: string } | undefined> {
+    const tried = new Set([exhausted]);
+    for (;;) {
+      const candidate = withBankedReset(await this.store.read(), family, (id) => this.usage.get(id), Date.now(), tried);
+      if (!candidate) return undefined;
+      tried.add(candidate.id);
+      const reply = await this.redeemOn(candidate, true);
+      if (reply.outcome === "reset") return { account: candidate, spent: true, detail: `Used a banked reset on ${candidate.label}.` };
+      if (reply.outcome === "not_limited") {
+        // Refilled meanwhile (another host or the user spent one): move there without spending another.
+        await this.afterReset(candidate.id, reply.left);
+        return { account: candidate, spent: false, detail: `${candidate.label} had room again, so no reset was spent.` };
+      }
+      console.log(`[ZeroSub] no automatic reset for ${candidate.label}: ${reply.message}`);
     }
   }
 

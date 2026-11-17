@@ -460,3 +460,81 @@ describe("a banked reset and Azure, both on", () => {
     expect(t.notes.at(-1)).toMatchObject({ outcome: "continued", to: "Azure" });
   });
 });
+
+describe("a reset banked on another subscription account, before Azure", () => {
+  const bHome = () => join(root, "b");
+  const reading = (usableNow: boolean): Usage => ({
+    fetchedAt: new Date().toISOString(), windows: [{ id: "primary", label: "5-hour", usedPercent: 100, resetsAt: null, minutes: 300 }],
+    error: null, cached: false, credits: null, resets: { available: 1, usableNow, blockedReason: null, expiresAt: null, refills: [], label: null },
+  });
+
+  /** Adds "b", a second ChatGPT subscription at its window limit, with one banked reset in its latest reading. */
+  async function withSecondAccount(t: Awaited<ReturnType<typeof failoverSetUp>>, usableNow = true) {
+    await t.store.update((draft) => {
+      draft.accounts.push(codexAccount({
+        id: "b", kind: "managed", home: bHome(), identity: "chatgpt|ws|b@example.com", email: "b@example.com",
+        limitedUntil: new Date(Date.now() + 3 * 60 * 60_000).toISOString(), limitKind: "window", limitedAt: new Date().toISOString(),
+      }));
+    });
+    (t.service as unknown as { usage: Map<string, Usage> }).usage.set("b", reading(usableNow));
+    t.redeemReset.mockImplementation(async (home: string | null) =>
+      home === bHome() ? { outcome: "reset", message: "Spent a banked reset.", left: 0 } : { outcome: "none", message: "none", left: 0 });
+  }
+
+  it("is spent there, and the agent moves there rather than onto Azure", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const t = await failoverSetUp(true, true, "none");
+    await withSecondAccount(t);
+    await t.endTurn(LIMIT);
+    expect(t.redeemReset.mock.calls.map((call) => call[0])).toEqual([null, bHome()]);
+    expect(t.created).toHaveLength(1);
+    const state = await t.store.read();
+    expect(state.bindings[t.created[0]!.agentId!]?.accountId).toBe("b");
+    expect(findAccount(state, "b")?.limitedUntil ?? null).toBeNull();
+    expect(t.notes.at(-1)).toMatchObject({ outcome: "continued", to: "B" });
+    expect(t.notes.at(-1)?.detail).toMatch(/banked reset on B/);
+    expect(t.notes.at(-1)?.detail).not.toMatch(/billed per token/);
+  });
+
+  it("is spent there with paid API fallback off too, rather than stopping", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const t = await failoverSetUp(false, true, "none");
+    await withSecondAccount(t);
+    await t.endTurn(LIMIT);
+    expect(t.created).toHaveLength(1);
+    expect((await t.store.read()).bindings[t.created[0]!.agentId!]?.accountId).toBe("b");
+  });
+
+  it("isn't spent while the reading says it can't be used now: the agent moves onto Azure", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const t = await failoverSetUp(true, true, "none");
+    await withSecondAccount(t, false);
+    await t.endTurn(LIMIT);
+    expect(t.redeemReset.mock.calls.map((call) => call[0])).toEqual([null]);
+    expect(t.created).toHaveLength(1);
+    expect((await t.store.read()).bindings[t.created[0]!.agentId!]?.accountId).toBe("azure");
+    expect(t.notes.at(-1)).toMatchObject({ outcome: "continued", to: "Azure" });
+  });
+
+  it("isn't spent with automatic resets off: the agent moves onto Azure", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const t = await failoverSetUp(true, false, "none");
+    await withSecondAccount(t);
+    await t.endTurn(LIMIT);
+    expect(t.redeemReset).not.toHaveBeenCalled();
+    expect((await t.store.read()).bindings[t.created[0]!.agentId!]?.accountId).toBe("azure");
+  });
+
+  it("comes after the agent's own account's reset, which keeps it where it is", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const t = await failoverSetUp(true, true, "none");
+    await withSecondAccount(t);
+    t.redeemReset.mockImplementation(async () => ({ outcome: "reset", message: "Spent a banked reset.", left: 0 }));
+    await t.endTurn(LIMIT);
+    expect(t.redeemReset.mock.calls.map((call) => call[0])).toEqual([null]);
+    expect(t.created).toEqual([]);
+    expect(t.notes.at(-1)).toMatchObject({ outcome: "reset", to: "A" });
+    expect((await t.store.read()).bindings.root?.accountId).toBe("a");
+    expect(findAccount(await t.store.read(), "b")?.limitKind).toBe("window");
+  });
+});

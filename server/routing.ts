@@ -134,19 +134,21 @@ export function mostAvailable(
  * A subscription account at a usage-window limit (5-hour or weekly) whose latest reading shows a
  * banked reset it can spend right now. With `autoRedeem` on, a new agent opens on it rather than on
  * a paid stand-in: its first turn hits the limit and spends the reset, as it would with paid fallback
- * off. Signed-out, disabled and budget-limited accounts never count, nor does any API account.
- * Preferred: the default, then the CLI login, then the most resets left.
+ * off. Failover uses it the same way: before a paid stand-in, it spends the reset on such an account
+ * and moves the agent there. Signed-out, disabled and budget-limited accounts never count, nor does
+ * any API account, nor any in `exclude`. Preferred: the default, then the CLI login, then the most resets left.
  */
 export function withBankedReset(
   state: StoredState,
   family: Family,
   usageOf: (accountId: string) => Usage | null | undefined,
   now: number,
+  exclude: ReadonlySet<string> = new Set(),
 ): StoredAccount | undefined {
   const preferred = defaultAccount(state, family)?.id;
   const left = (account: StoredAccount) => usageOf(account.id)?.resets?.available ?? 0;
   return accountsOf(state, family)
-    .filter((account) => account.family !== "pi" && account.auth !== "api" && !isLastResort(account) &&
+    .filter((account) => !exclude.has(account.id) && account.family !== "pi" && account.auth !== "api" && !isLastResort(account) &&
       account.signedIn && !account.disabled && account.limitKind === "window" && isLimited(account, now))
     .filter((account) => {
       const resets = usageOf(account.id)?.resets;

@@ -24,7 +24,10 @@ export const preferences = defineSettings({
     moveAgentsOnDefaultChange: z.boolean().default(true),
     /** New agents choose an account by usage instead of the default. */
     balanceNewAgents: z.boolean().default(false),
-    /** When every account of a provider is at its limit, spend a banked reset instead of stopping. */
+    /**
+     * When every account of a provider is at its limit, spend a banked reset instead of stopping: the
+     * agent's own account's, else one banked on another account, which the agent then moves to.
+     */
     autoRedeem: z.boolean().default(false),
     /**
      * A ChatGPT account at its limit stays in use while it has ChatGPT credits, so new agents may
